@@ -13,6 +13,13 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import OpenAI from "openai";
+
+const openai = new OpenAI({
+  apiKey: "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",
+  baseURL: "https://openrouter.ai/api/v1",
+  dangerouslyAllowBrowser: true
+});
 
 // ─── Design Tokens - Apple Navy & White Theme ────────────────────────────────
 const COLORS = {
@@ -430,7 +437,7 @@ function calculateDistance(lat1, lng1, lat2, lng2) {
   const dLat = (lat2 - lat1) * Math.PI / 180;
   const dLng = (lng2 - lng1) * Math.PI / 180;
   const a = 
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) 
     Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
     Math.sin(dLng / 2) * Math.sin(dLng / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
@@ -508,24 +515,40 @@ async function callDetectAPI(imageBlob) {
 }
 
 // Simple chatbot logic
-function getChatbotResponse(userMessage) {
-  const message = userMessage.toLowerCase().trim();
-  
-  // Check for emergency keywords
-  if (message.includes("112") || message.includes("emergency") || message.includes("आपातकाल")) {
-    return CHATBOT_RESPONSES.emergency[Math.floor(Math.random() * CHATBOT_RESPONSES.emergency.length)];
-  } else if (message.includes("hi") || message.includes("hello") || message.includes("hey") || message.includes("नमस्ते")) {
-    return CHATBOT_RESPONSES.greetings[Math.floor(Math.random() * CHATBOT_RESPONSES.greetings.length)];
-  } else if (message.includes("trauma") || message.includes("wound") || message.includes("injury") || message.includes("आघात")) {
-    return CHATBOT_RESPONSES.trauma[Math.floor(Math.random() * CHATBOT_RESPONSES.trauma.length)];
-  } else if (message.includes("location") || message.includes("where") || message.includes("स्थान") || message.includes("कहां")) {
-    return CHATBOT_RESPONSES.location[Math.floor(Math.random() * CHATBOT_RESPONSES.location.length)];
-  } else if (message.includes("hospital") || message.includes("emergency") || message.includes("doctor") || message.includes("अस्पताल") || message.includes("डॉक्टर")) {
-    return CHATBOT_RESPONSES.hospital[Math.floor(Math.random() * CHATBOT_RESPONSES.hospital.length)];
-  } else {
-    return CHATBOT_RESPONSES.unknown[Math.floor(Math.random() * CHATBOT_RESPONSES.unknown.length)];
+
+  async function getChatbotResponse(userMessage) {
+  try {
+    const response = await openai.chat.completions.create({
+  model: "openai/gpt-4o-mini",
+  messages: [
+    {
+      role: "system",
+      content: `You are a medical injury assistant.
+
+Give first aid advice only.
+Do NOT diagnose.
+Do NOT give medicines.
+
+Always include:
+1. What it might be
+2. First aid steps
+3. Warning signs
+4. When to see a doctor`
+    },
+    {
+      role: "user",
+      content: userMessage
+    }
+  ]
+});
+
+    return response.choices[0].message.content;
+  } catch (error) {
+    console.error(error);
+    return "Error getting response";
   }
 }
+
 
 // ─── Indian Cities Database (Move outside component) ────────────────────────
 const INDIAN_CITIES = {
@@ -2208,32 +2231,47 @@ function ChatPage() {
 
 
 
-  const handleSendMessage = useCallback(() => {
-    if (!inputValue.trim()) return;
+  const handleSendMessage = useCallback(async () => {
+  if (!inputValue.trim()) return;
 
-    const userMessage = {
-      id: messages.length + 1,
-      text: inputValue,
-      sender: "user",
+  const userMessage = {
+    id: messages.length + 1,
+    text: inputValue,
+    sender: "user",
+    timestamp: new Date(),
+  };
+
+  setMessages(prev => [...prev, userMessage]);
+  setInputValue("");
+  setIsLoading(true);
+
+  try {
+    const reply = await getChatbotResponse(inputValue);
+
+    const botResponse = {
+      id: messages.length + 2,
+      text: reply,
+      sender: "bot",
       timestamp: new Date(),
     };
 
-    setMessages(prev => [...prev, userMessage]);
-    setInputValue("");
-    setIsLoading(true);
+    setMessages(prev => [...prev, botResponse]);
+  } catch (error) {
+    console.error(error);
 
-    // Simulate bot response delay
-    setTimeout(() => {
-      const botResponse = {
+    setMessages(prev => [
+      ...prev,
+      {
         id: messages.length + 2,
-        text: getChatbotResponse(inputValue),
+        text: "Error getting response",
         sender: "bot",
         timestamp: new Date(),
-      };
-      setMessages(prev => [...prev, botResponse]);
-      setIsLoading(false);
-    }, 600);
-  }, [inputValue, messages.length]);
+      }
+    ]);
+  }
+
+  setIsLoading(false);
+}, [inputValue, messages.length]);
 
   const handleKeyPress = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
