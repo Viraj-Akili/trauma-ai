@@ -3,11 +3,26 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>TraumaTriage AI - Emergency Trauma Detection System</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; }
+    </style>
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      // Google Maps API callback
+      window.initGoogleMaps = function() {
+        console.log('✅ Google Maps API loaded successfully');
+      };
+      window.gm_authFailure = function() {
+        console.error('❌ Google Maps API Key Error - Authentication failed');
+      };
+    </script>
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAjW39lfuB_4ilnWaE86jAaD9xy2hUOuzM&libraries=places,geometry,drawing&callback=initGoogleMaps" async defer></script>
     <script type="module" src="/main.jsx"></script>
   </body>
 </html>
