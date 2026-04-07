@@ -2007,14 +2007,15 @@ function MapPage({ location, locationCity }) {
       {/* Hospital List - Responsive */}
       {!selectedHospital && nearbyHospitals.length > 0 && (
         <div style={{
-          position: "absolute",
-          bottom: 0,
-          left: 0,
-          right: 0,
+          position: "fixed",
+          bottom: "75px",
+          left: "50%",
+          transform: "translateX(-50%)",
           width: "100%",
+          maxWidth: "480px",
           background: "#fff",
           borderRadius: "16px 16px 0 0",
-          maxHeight: "50vh",
+          maxHeight: "55vh",
           overflowY: "auto",
           overflowX: "hidden",
           boxShadow: "0 -4px 16px rgba(0,0,0,0.2)",
