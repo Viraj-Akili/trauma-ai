@@ -49,14 +49,27 @@ def load_html(url):
 # -------------------------------
 # ✂️ CHUNK TEXT
 # -------------------------------
-def chunk_text(text, chunk_size=500):
+import re
+
+def chunk_text(text, chunk_size=300, overlap=50):
+    sentences = re.split(r'(?<=[.!?]) +', text)
+
     chunks = []
+    current = ""
 
-    for i in range(0, len(text), chunk_size):
-        chunk = text[i:i+chunk_size].strip()
+    for sentence in sentences:
+        # If adding sentence stays within limit
+        if len(current) + len(sentence) < chunk_size:
+            current += " " + sentence
+        else:
+            chunks.append(current.strip())
+            
+            # 🔥 Add overlap from previous chunk
+            overlap_text = current[-overlap:]
+            current = overlap_text + " " + sentence
 
-        if len(chunk) > 100:
-            chunks.append(chunk)
+    if current:
+        chunks.append(current.strip())
 
     return chunks
 
@@ -122,10 +135,10 @@ def build_index(pdf_paths=None, urls=None):
 
     print(f"[RAG] Clean medical chunks: {len(all_chunks)}")
 
-    embeddings = embed_model.encode(all_chunks)
+    embeddings = embed_model.encode(all_chunks, normalize_embeddings=True)
 
     dim = len(embeddings[0])
-    index = faiss.IndexFlatL2(dim)
+    index = faiss.IndexFlatIP(dim)
     index.add(np.array(embeddings))
 
     return index, all_chunks
@@ -133,18 +146,15 @@ def build_index(pdf_paths=None, urls=None):
 # -------------------------------
 # 🔍 RETRIEVE
 # -------------------------------
-def retrieve(query, index, chunks, k=5):
+def retrieve(query, index, chunks, k=8):
 
-    query_vec = embed_model.encode([query])
+    query_vec = embed_model.encode([query], normalize_embeddings=True)
     D, I = index.search(query_vec, k)
 
     results = []
     for i in I[0]:
         if i < len(chunks):
             chunk = chunks[i]
-
-            # 🔥 extra filter (NEW)
-            if any(word in chunk.lower() for word in query.split()):
-                results.append(chunk)
+            results.append(chunk)
 
     return results

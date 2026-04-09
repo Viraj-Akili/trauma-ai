@@ -501,17 +501,136 @@ const CHATBOT_RESPONSES = {
   ],
 };
 
+// ─── Backend URL ─────────────────────────────────────────────────────────────
+// Using "/api" routes through Vite's proxy → avoids all CORS issues.
+// Vite rewrites /api/detect → http://localhost:8000/detect automatically.
+const BACKEND_URL = "/api";
+
+// ─── Data adapter: maps backend /detect response → frontend result shape ─────
+function adaptBackendResult(data) {
+  // Backend severity: "critical" / "moderate" / "low"
+  // Frontend severity: "CRITICAL" / "MODERATE" / "LOW"
+  const severityMap = { critical: "CRITICAL", moderate: "MODERATE", low: "LOW" };
+  const severity = severityMap[data.severity] || "LOW";
+
+  // Build injury label from top detected injury
+  const topInjury = data.injuries_detected?.[0];
+
+  // Clean up CLIP label: "person with heavy bleeding from arm" → "Heavy Bleeding From Arm"
+  const rawLabel = topInjury?.label || "General Injury";
+  const injuryLabel = rawLabel
+    .replace(/^person with /i, "")
+    .replace(/^person /i, "")
+    .split(" ")
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+
+  // CLIP confidence scaled to a human-readable 0-100
+  // Raw softmax over 30+ labels is naturally low (~5-25%), so we scale it
+  const rawConf = topInjury?.confidence ?? 0;
+  const confidence = Math.min(99, Math.round(rawConf * 350)); // scale 0.28 → ~98%
+
+  // Parse rag_answer into instruction steps
+  // rag_answer format from backend:
+  // "Condition: ...\nRisk: ...\nSteps:\n1.\n2.\n3.\nRed Flags:\n-\n-"
+  let instructions = [];
+  if (data.rag_answer) {
+    const stepsMatch = data.rag_answer.match(/Steps:\s*([\s\S]*?)(?:Red Flags:|$)/i);
+    if (stepsMatch) {
+      instructions = stepsMatch[1]
+        .split(/\n/)
+        .map(l => l.replace(/^\d+\.\s*/, "").trim())
+        .filter(Boolean);
+    }
+  }
+  // Fallback instructions if RAG parsing fails
+  if (instructions.length === 0) {
+    instructions = [
+      "Check if the person is breathing and conscious",
+      "Control any visible bleeding with firm pressure",
+      "Keep the person still and calm",
+      "Call 112 (Emergency) or 102 (Ambulance) immediately",
+      "Do not give food or water until assessed by a doctor",
+    ];
+  }
+
+  // Add low-confidence note at top of instructions if flagged
+  if (data.low_confidence) {
+    instructions = [
+      "⚠️ Low confidence scan — try better lighting or move closer to the injury",
+      ...instructions,
+    ];
+  }
+
+  // Derive region from injury label
+  const regionMap = [
+    [/head|skull|brain|cranial/i, "Cranial"],
+    [/arm|wrist|hand|finger|elbow/i, "Upper Limb"],
+    [/leg|foot|ankle|knee/i, "Lower Limb"],
+    [/chest|heart/i, "Thoracic"],
+    [/burn/i, "Surface"],
+    [/back|spine/i, "Spinal"],
+  ];
+  let region = "General";
+  for (const [pattern, label] of regionMap) {
+    if (pattern.test(injuryLabel) || (topInjury && pattern.test(topInjury.label))) {
+      region = label;
+      break;
+    }
+  }
+
+  return {
+    // Fields expected by ResultPanel / VoiceGuide / CameraPage preview
+    injury: injuryLabel,
+    severity,
+    confidence,
+    region,
+    instructions,
+    // Extra fields from backend (available for future use)
+    posture: data.posture,
+    triage: data.triage,
+    rag_answer: data.rag_answer,
+    rag_sources: data.rag_sources,
+    questions: data.questions,
+    injuries_detected: data.injuries_detected,
+  };
+}
+
 async function callDetectAPI(imageBlob) {
-  // Simulate API latency
-  await new Promise((r) => setTimeout(r, 800 + Math.random() * 700));
+  const formData = new FormData();
+  formData.append("file", imageBlob, "capture.jpg");
 
-  // In production, replace with:
-  // const formData = new FormData();
-  // formData.append('frame', imageBlob);
-  // const res = await fetch('/detect', { method: 'POST', body: formData });
-  // return res.json();
+  const res = await fetch(`${BACKEND_URL}/detect`, {
+    method: "POST",
+    body: formData,
+  });
 
-  return MOCK_RESPONSES[Math.floor(Math.random() * MOCK_RESPONSES.length)];
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.detail || `Backend error: ${res.status}`);
+  }
+
+  const data = await res.json();
+
+  // Backend returns { error: "..." } — treat as low-confidence, not a crash
+  if (data.error) {
+    return {
+      injury: "Unclear Image",
+      severity: "LOW",
+      confidence: 0,
+      region: "Unknown",
+      low_confidence: true,
+      instructions: [
+        "⚠️ " + data.error,
+        "Move closer to the injury and ensure good lighting",
+        "Try again — hold the camera steady while capturing",
+        "Call 112 immediately if this is a life-threatening emergency",
+        "Do not wait for AI confirmation in critical situations",
+      ],
+    };
+  }
+
+  return adaptBackendResult(data);
 }
 
 // Simple chatbot logic
@@ -963,6 +1082,7 @@ function CameraFeed({ onResult, onError }) {
   const [cameraActive, setCameraActive] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [detecting, setDetecting] = useState(false);
+  const [capturedImage, setCapturedImage] = useState(null);
   const [localResult, setLocalResult] = useState(null);
   const [frameCount, setFrameCount] = useState(0);
 
@@ -987,35 +1107,64 @@ function CameraFeed({ onResult, onError }) {
 
   // Capture frame and send to API
   const captureAndDetect = useCallback(async () => {
-    if (!videoRef.current || !canvasRef.current || detecting) return;
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0);
+  if (!videoRef.current || !canvasRef.current) return;
+
+  const video = videoRef.current;
+  const canvas = canvasRef.current;
+  const ctx = canvas.getContext("2d");
+
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+
+  ctx.drawImage(video, 0, 0);
+
+  canvas.toBlob(async (blob) => {
+  if (!blob) return;
+
+  const imageUrl = URL.createObjectURL(blob);
+  setCapturedImage(imageUrl);
+
+    // ✅ STOP camera after capture
+    streamRef.current?.getTracks().forEach(track => track.stop());
+    setCameraActive(false);
+    setScanning(false);
+
+    // ✅ Save image (for backend later)
+    console.log("Captured image:", blob);
 
     setDetecting(true);
-    setFrameCount(n => n + 1);
+
     try {
-      canvas.toBlob(async (blob) => {
-        const result = await callDetectAPI(blob);
-        setLocalResult(result);
-        onResult?.(result);
-        setDetecting(false);
-      }, "image/jpeg", 0.8);
-    } catch {
-      setDetecting(false);
+      const result = await callDetectAPI(blob);
+      setLocalResult(result);
+      onResult?.(result);
+    } catch (err) {
+      console.error("Detection error:", err);
+      const errorResult = {
+        injury: "Detection Failed",
+        severity: "LOW",
+        confidence: 0,
+        region: "Unknown",
+        instructions: [
+          err.message || "Could not reach the backend server.",
+          "Make sure the FastAPI backend is running: cd VLM && uvicorn main:app --reload",
+          "Check that http://localhost:8000 is accessible.",
+          "Try capturing a clearer, well-lit image of the injury.",
+          "Call 112 if this is a real emergency — do not wait for AI.",
+        ],
+      };
+      setLocalResult(errorResult);
+      onResult?.(errorResult);
     }
-  }, [detecting, onResult]);
+
+    setDetecting(false);
+
+  }, "image/jpeg", 0.9);
+
+}, [onResult]);
 
   // Auto-detect every 3 seconds
-  useEffect(() => {
-    if (cameraActive) {
-      timerRef.current = setInterval(captureAndDetect, 3000);
-    }
-    return () => clearInterval(timerRef.current);
-  }, [cameraActive, captureAndDetect]);
+  
 
   useEffect(() => {
     startCamera();
@@ -1033,7 +1182,37 @@ function CameraFeed({ onResult, onError }) {
         muted
         playsInline
       />
+      {capturedImage && (
+  <img
+    src={capturedImage}
+    style={{
+      position: "absolute",
+      inset: 0,
+      width: "100%",
+      height: "100%",
+      objectFit: "cover",
+      zIndex: 5
+    }}
+  />
+)}
       <canvas ref={canvasRef} style={{display:"none"}}/>
+      <button
+  onClick={captureAndDetect}
+  style={{
+    position: "absolute",
+    bottom: 90,
+    left: "50%",
+    transform: "translateX(-50%)",
+    width: 70,
+    height: 70,
+    borderRadius: "50%",
+    background: "#fff",
+    border: "4px solid #ccc",
+    boxShadow: "0 4px 20px rgba(0,0,0,0.5)",
+    cursor: "pointer",
+    zIndex: 20
+  }}
+/>
       <DetectionOverlay result={localResult} scanning={scanning}/>
 
       {/* Processing indicator */}
@@ -1069,7 +1248,7 @@ function CameraFeed({ onResult, onError }) {
 }
 
 // ─── Q&A Panel Component ──────────────────────────────────────────────────────
-function QnAPanel({ result, onSeverityUpdate }) {
+function QnAPanel({ result, onSeverityUpdate, onComplete }) {
   const questions = [
     { id: "conscious", text: "Is the person conscious?", yesEffect: null, noEffect: "CRITICAL" },
     { id: "breathing", text: "Is the person breathing?", yesEffect: null, noEffect: "CRITICAL" },
@@ -1079,20 +1258,25 @@ function QnAPanel({ result, onSeverityUpdate }) {
 
   const [answers, setAnswers] = useState({});
   const [currentQ, setCurrentQ] = useState(0);
+  const [done, setDone] = useState(false);
 
   const handleAnswer = (qId, answer) => {
     const q = questions.find(q => q.id === qId);
-    setAnswers(prev => ({...prev, [qId]: answer}));
 
-    // Update severity based on critical indicators
-    if (answer === "no" && q.noEffect === "CRITICAL") {
-      onSeverityUpdate?.("CRITICAL");
-    } else if (answer === "yes" && q.yesEffect === "CRITICAL") {
-      onSeverityUpdate?.("CRITICAL");
-    }
+    if (answer === "no" && q.noEffect === "CRITICAL") onSeverityUpdate?.("CRITICAL");
+    else if (answer === "yes" && q.yesEffect === "CRITICAL") onSeverityUpdate?.("CRITICAL");
+
+    const newAnswers = { ...answers, [qId]: answer };
+    setAnswers(newAnswers);
 
     if (currentQ < questions.length - 1) {
       setTimeout(() => setCurrentQ(n => n + 1), 400);
+    } else {
+      // Last question answered — mark done and call onComplete
+      setTimeout(() => {
+        setDone(true);
+        onComplete?.();
+      }, 500);
     }
   };
 
@@ -1100,29 +1284,28 @@ function QnAPanel({ result, onSeverityUpdate }) {
   const isAnswered = answers[activeQ?.id] !== undefined;
 
   return (
-    <div style={{...glassCard,padding:"1.25rem"}}>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:"1rem"}}>
+    <div style={{...glassCard, padding:"1.25rem"}}>
+      <div style={{display:"flex", alignItems:"center", gap:8, marginBottom:"1rem"}}>
         <div style={{
-          width:28,height:28,borderRadius:8,
+          width:28, height:28, borderRadius:8,
           background:"rgba(129,140,248,0.15)",
-          display:"flex",alignItems:"center",justifyContent:"center",
+          display:"flex", alignItems:"center", justifyContent:"center",
           color:"#818cf8",
         }}>
           <Icons.Activity/>
         </div>
-        <span style={{fontSize:"0.8rem",fontWeight:600,color:"rgba(255,255,255,0.9)",letterSpacing:"0.08em"}}>
+        <span style={{fontSize:"0.8rem", fontWeight:600, color:"rgba(255,255,255,0.9)", letterSpacing:"0.08em"}}>
           PATIENT ASSESSMENT
         </span>
-        <span style={{
-          marginLeft:"auto",fontSize:"0.7rem",
-          color:"rgba(255,255,255,0.4)",
-        }}>{Object.keys(answers).length}/{questions.length}</span>
+        <span style={{marginLeft:"auto", fontSize:"0.7rem", color:"rgba(255,255,255,0.4)"}}>
+          {Object.keys(answers).length}/{questions.length}
+        </span>
       </div>
 
       {/* Progress bar */}
-      <div style={{height:2,background:"rgba(255,255,255,0.06)",borderRadius:1,marginBottom:"1rem"}}>
+      <div style={{height:2, background:"rgba(255,255,255,0.06)", borderRadius:1, marginBottom:"1rem"}}>
         <div style={{
-          height:"100%",borderRadius:1,
+          height:"100%", borderRadius:1,
           background:"linear-gradient(90deg,#0066ff,#3399ff)",
           width:`${(Object.keys(answers).length / questions.length) * 100}%`,
           transition:"width 0.4s ease",
@@ -1132,13 +1315,12 @@ function QnAPanel({ result, onSeverityUpdate }) {
       {/* Previous answers */}
       {questions.slice(0, currentQ).map((q) => (
         <div key={q.id} style={{
-          display:"flex",justifyContent:"space-between",alignItems:"center",
-          padding:"6px 0",borderBottom:"1px solid rgba(255,255,255,0.04)",
-          marginBottom:4,
+          display:"flex", justifyContent:"space-between", alignItems:"center",
+          padding:"6px 0", borderBottom:"1px solid rgba(255,255,255,0.04)", marginBottom:4,
         }}>
-          <span style={{fontSize:"0.75rem",color:"rgba(255,255,255,0.35)"}}>{q.text}</span>
+          <span style={{fontSize:"0.75rem", color:"rgba(255,255,255,0.35)"}}>{q.text}</span>
           <span style={{
-            fontSize:"0.7rem",fontWeight:600,letterSpacing:"0.08em",
+            fontSize:"0.7rem", fontWeight:600, letterSpacing:"0.08em",
             color: answers[q.id] === "yes" ? "#10b981" : "#f87171",
           }}>
             {answers[q.id]?.toUpperCase()}
@@ -1147,30 +1329,24 @@ function QnAPanel({ result, onSeverityUpdate }) {
       ))}
 
       {/* Active question */}
-      {activeQ && !isAnswered && (
+      {!done && activeQ && !isAnswered && (
         <div style={{marginTop:8}}>
-          <p style={{
-            fontSize:"0.875rem",color:"rgba(255,255,255,0.9)",
-            marginBottom:"0.875rem",lineHeight:1.5,
-          }}>
+          <p style={{fontSize:"0.875rem", color:"rgba(255,255,255,0.9)", marginBottom:"0.875rem", lineHeight:1.5}}>
             {activeQ.text}
           </p>
-          <div style={{display:"flex",gap:8}}>
+          <div style={{display:"flex", gap:8}}>
             {["yes","no"].map(ans => (
               <button
                 key={ans}
                 onClick={() => handleAnswer(activeQ.id, ans)}
                 style={{
-                  flex:1,padding:"10px",
-                  background: ans === "yes"
-                    ? "rgba(16,185,129,0.12)"
-                    : "rgba(239,68,68,0.12)",
+                  flex:1, padding:"10px",
+                  background: ans === "yes" ? "rgba(16,185,129,0.12)" : "rgba(239,68,68,0.12)",
                   border: `1px solid ${ans === "yes" ? "rgba(16,185,129,0.3)" : "rgba(239,68,68,0.3)"}`,
                   borderRadius:10,
                   color: ans === "yes" ? "#6ee7b7" : "#fca5a5",
-                  fontWeight:700,fontSize:"0.875rem",
-                  cursor:"pointer",letterSpacing:"0.08em",
-                  transition:"all 0.15s",
+                  fontWeight:700, fontSize:"0.875rem",
+                  cursor:"pointer", letterSpacing:"0.08em", transition:"all 0.15s",
                 }}
                 onMouseEnter={e => e.target.style.transform="scale(1.02)"}
                 onMouseLeave={e => e.target.style.transform="scale(1)"}
@@ -1182,16 +1358,16 @@ function QnAPanel({ result, onSeverityUpdate }) {
         </div>
       )}
 
-      {currentQ >= questions.length && (
+      {/* Completion message */}
+      {done && (
         <div style={{
-          display:"flex",alignItems:"center",gap:8,
-          padding:"10px",
+          display:"flex", alignItems:"center", gap:8, padding:"10px",
           background:"rgba(16,185,129,0.08)",
           border:"1px solid rgba(16,185,129,0.2)",
-          borderRadius:10,marginTop:8,
+          borderRadius:10, marginTop:8,
         }}>
           <Icons.Check/>
-          <span style={{fontSize:"0.8rem",color:"#6ee7b7",fontWeight:500}}>Assessment complete</span>
+          <span style={{fontSize:"0.8rem", color:"#6ee7b7", fontWeight:500}}>Assessment complete — loading results...</span>
         </div>
       )}
     </div>
@@ -1279,136 +1455,76 @@ function VoiceGuide({ result, onReplay, onStop }) {
 }
 
 // ─── Result Panel Component ───────────────────────────────────────────────────
-function ResultPanel({ result, onSeverityUpdate }) {
-  if (!result) return (
-    <div style={{...glassCard,padding:"2rem",textAlign:"center"}}>
-      <div style={{color:"rgba(255,255,255,0.15)",marginBottom:"1rem",fontSize:"2rem"}}>◎</div>
-      <p style={{color:"rgba(255,255,255,0.3)",fontSize:"0.875rem",letterSpacing:"0.05em"}}>
-        Awaiting detection results...
-      </p>
-    </div>
-  );
+function ResultPage({ result, onSeverityUpdate, assessmentComplete, setAssessmentComplete }) {
+  const { speak, replay, stop } = useVoiceSpeech();
 
-  const sevKey = result.severity?.toLowerCase();
-  const colors = COLORS[sevKey] || COLORS.low;
+  useEffect(() => {
+    if (result && assessmentComplete) {
+      const text = `${result.severity} alert. ${result.injury} detected. ${result.instructions[0]}. ${result.instructions[1]}.`;
+      speak(text);
+    }
+  }, [result, assessmentComplete, speak]);
 
   return (
     <div style={{
-      ...glassCard,
-      borderColor: `${colors.accent}30`,
-      background: `${colors.bg}cc`,
-      padding:"1.25rem",
+      flex:1, overflowY:"auto",
+      background:"linear-gradient(160deg,#0a0e27 0%,#1a1f3a 100%)",
+      padding:"1rem 1rem 80px 1rem", display:"flex", flexDirection:"column", gap:"1rem",
     }}>
       {/* Header */}
-      <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:"1rem"}}>
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"0.5rem 0" }}>
+        <div style={{
+          width:32, height:32, borderRadius:10,
+          background:"rgba(129,140,248,0.15)",
+          display:"flex", alignItems:"center", justifyContent:"center",
+          color:"#818cf8",
+        }}>
+          <Icons.Activity/>
+        </div>
         <div>
-          <div style={{
-            display:"inline-flex",alignItems:"center",gap:6,
-            background:`${colors.accent}20`,
-            border:`1px solid ${colors.accent}40`,
-            padding:"3px 10px",borderRadius:20,
-            fontSize:"0.65rem",fontWeight:700,color:colors.text,
-            letterSpacing:"0.12em",marginBottom:8,
-          }}>
-            <div style={{
-              width:6,height:6,borderRadius:"50%",
-              background:colors.accent,
-              animation: result.severity === "CRITICAL" ? "pulse 1s ease-in-out infinite" : "none",
-            }}/>
-            {result.severity}
-          </div>
-          <h3 style={{
-            fontSize:"1.25rem",fontWeight:700,
-            color:"rgba(255,255,255,0.95)",margin:0,
-          }}>{result.injury}</h3>
-          <p style={{
-            fontSize:"0.75rem",color:"rgba(255,255,255,0.4)",
-            marginTop:4,letterSpacing:"0.05em",
-          }}>
-            Region: {result.region} · Confidence: {result.confidence}%
+          <h2 style={{margin:0, fontSize:"1.1rem", fontWeight:700, color:"rgba(255,255,255,0.95)"}}>
+            Analysis Results
+          </h2>
+          <p style={{margin:0, fontSize:"0.7rem", color:"rgba(255,255,255,0.35)", letterSpacing:"0.06em"}}>
+            {result ? (assessmentComplete ? "ASSESSMENT COMPLETE" : "PATIENT ASSESSMENT") : "AWAITING SCAN"}
           </p>
         </div>
-        <div style={{
-          width:48,height:48,borderRadius:"50%",
-          background:`${colors.accent}15`,
-          border:`2px solid ${colors.accent}40`,
-          display:"flex",alignItems:"center",justifyContent:"center",
-          color:colors.accent,
-          boxShadow:`0 0 20px ${colors.glow}`,
-        }}>
-          <Icons.AlertTriangle/>
-        </div>
       </div>
 
-      {/* Severity bar */}
-      <div style={{marginBottom:"1.25rem"}}>
-        <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
-          <span style={{fontSize:"0.65rem",color:"rgba(255,255,255,0.35)",letterSpacing:"0.1em"}}>
-            SEVERITY LEVEL
-          </span>
-          <span style={{fontSize:"0.65rem",color:colors.text,fontWeight:700,letterSpacing:"0.1em"}}>
-            {result.severity}
-          </span>
-        </div>
-        <div style={{height:4,background:"rgba(255,255,255,0.06)",borderRadius:2,overflow:"hidden"}}>
-          <div style={{
-            height:"100%",borderRadius:2,
-            background:`linear-gradient(90deg,${colors.accent}80,${colors.accent})`,
-            width: result.severity==="CRITICAL" ? "100%" : result.severity==="MODERATE" ? "60%" : "30%",
-            transition:"width 1s ease",
-            boxShadow:`0 0 8px ${colors.glow}`,
-          }}/>
-        </div>
-      </div>
+      {result && !assessmentComplete && (
+        <QnAPanel
+          result={result}
+          onSeverityUpdate={onSeverityUpdate}
+          onComplete={() => setAssessmentComplete(true)}
+        />
+      )}
 
-      {/* Instructions */}
-      <div>
-        <p style={{
-          fontSize:"0.7rem",fontWeight:600,letterSpacing:"0.1em",
-          color:"rgba(255,255,255,0.5)",marginBottom:"0.75rem",
-        }}>
-          EMERGENCY INSTRUCTIONS
+      {result && assessmentComplete && (
+        <>
+          <VoiceGuide result={result} onReplay={replay} onStop={stop}/>
+          <ResultPanel result={result} onSeverityUpdate={onSeverityUpdate}/>
+        </>
+      )}
+
+      {!result && (
+        <div style={{...glassCard, padding:"2rem", textAlign:"center"}}>
+          <div style={{color:"rgba(255,255,255,0.15)", marginBottom:"1rem", fontSize:"2rem"}}>◎</div>
+          <p style={{color:"rgba(255,255,255,0.3)", fontSize:"0.875rem", letterSpacing:"0.05em"}}>
+            No scan yet — go to the Scan tab to capture an image.
+          </p>
+        </div>
+      )}
+
+      {/* Disclaimer */}
+      <div style={{...glassCard, padding:"12px", display:"flex", gap:10, alignItems:"flex-start"}}>
+        <div style={{color:"rgba(255,255,255,0.3)", flexShrink:0, marginTop:1}}>
+          <Icons.Info/>
+        </div>
+        <p style={{fontSize:"0.7rem", color:"rgba(255,255,255,0.3)", lineHeight:1.5, margin:0}}>
+          AI detection is for guidance only and does not replace professional medical assessment.
+          Call 112 (Emergency), 100 (Police), or 102 (Ambulance) in India for critical situations.
         </p>
-        <div style={{display:"flex",flexDirection:"column",gap:8}}>
-          {result.instructions.map((step, i) => (
-            <div key={i} style={{
-              display:"flex",alignItems:"flex-start",gap:10,
-              padding:"8px 10px",
-              background:"rgba(255,255,255,0.03)",
-              border:"1px solid rgba(255,255,255,0.05)",
-              borderRadius:10,
-            }}>
-              <span style={{
-                flexShrink:0,width:20,height:20,borderRadius:6,
-                background:`${colors.accent}20`,
-                display:"flex",alignItems:"center",justifyContent:"center",
-                fontSize:"0.65rem",fontWeight:700,color:colors.text,
-              }}>{i+1}</span>
-              <span style={{fontSize:"0.8rem",color:"rgba(255,255,255,0.75)",lineHeight:1.5}}>
-                {step}
-              </span>
-            </div>
-          ))}
-        </div>
       </div>
-
-      {/* Emergency call button */}
-      <button style={{
-        width:"100%",marginTop:"1rem",padding:"12px",
-        background:"rgba(239,68,68,0.15)",
-        border:"1px solid rgba(239,68,68,0.4)",
-        borderRadius:12,
-        display:"flex",alignItems:"center",justifyContent:"center",gap:8,
-        color:"#fca5a5",fontWeight:700,fontSize:"0.875rem",
-        cursor:"pointer",letterSpacing:"0.05em",
-        transition:"all 0.15s",
-      }}
-      onMouseEnter={e => e.currentTarget.style.background="rgba(239,68,68,0.25)"}
-      onMouseLeave={e => e.currentTarget.style.background="rgba(239,68,68,0.15)"}
-      onClick={() => window.location.href = "tel:112"}
-      >
-        <Icons.Phone/> CALL 112 (EMERGENCY)
-      </button>
     </div>
   );
 }
@@ -1457,754 +1573,225 @@ const geocodeAddress = async (address) => {
 };
 
 // ─── Google Map Page - Real-time Hospital Finder with Live Geolocation ──────
-function MapPage({ location, locationCity }) {
-  const mapRef = useRef(null);
-  const mapInstanceRef = useRef(null);
-  const userMarkerRef = useRef(null);
-  const markersRef = useRef([]);
-  const [nearbyHospitals, setNearbyHospitals] = useState([]);
-  const [selectedHospital, setSelectedHospital] = useState(null);
-  const [loadingDistances, setLoadingDistances] = useState(true);
-  const [mapError, setMapError] = useState(null);
-  const [locationAccuracy, setLocationAccuracy] = useState(null);
+/**
+ * FIXED MapPage — Trauma AID
+ * Drop-in replacement. Uses Leaflet + Overpass API (no Google Maps needed).
+ * Falls back to curated TN hospital list if Overpass is unavailable.
+ */
 
-  // Initialize Google Map - Only Once
-  useEffect(() => {
-    if (!mapRef.current || mapInstanceRef.current) return;
+const FALLBACK_HOSPITALS = [
+  { id:"f1", name:"Christian Medical College Hospital", lat:12.9241, lng:79.1326, type:"Level 1 Trauma Center",   phone:"+91-416-228-4000", address:"Vellore 632004" },
+  { id:"f2", name:"Apollo Specialty Hospital Vellore",  lat:12.9475, lng:79.1205, type:"Multi-Specialty Hospital", phone:"+91-416-228-5000", address:"Vellore 632006" },
+  { id:"f3", name:"Government Vellore Medical College", lat:12.9194, lng:79.1325, type:"Government Hospital",      phone:"+91-416-222-2100", address:"Vellore 632011" },
+  { id:"f4", name:"Srimanta Hospital Vellore",          lat:12.9523, lng:79.1342, type:"Emergency Trauma Center",  phone:"+91-416-224-1111", address:"Vellore 632004" },
+  { id:"f5", name:"VIT Medical College Hospital",       lat:12.9701, lng:79.1559, type:"Emergency Trauma Center",  phone:"+91-416-224-2555", address:"Vellore 632014" },
+  { id:"f6", name:"Fortis Malar Hospital Chennai",      lat:13.0499, lng:80.2247, type:"Emergency Trauma Center",  phone:"+91-44-4228-6666", address:"Adyar, Chennai 600020" },
+  { id:"f7", name:"Apollo Hospitals Chennai",           lat:13.0668, lng:80.2776, type:"Level 1 Trauma Center",    phone:"+91-44-2829-0200", address:"Greames Road, Chennai 600006" },
+  { id:"f8", name:"Kauvery Hospital Chennai",           lat:13.0827, lng:80.2707, type:"Multi-Specialty Hospital",  phone:"+91-44-4000-6000", address:"Chennai 600010" },
+  { id:"f9", name:"Saveetha Medical College",           lat:12.7674, lng:80.1614, type:"Level 1 Trauma Center",    phone:"+91-44-4734-4734", address:"Chengalpattu 603102" },
+  { id:"f10",name:"Aravind Eye Hospital Vellore",       lat:12.9360, lng:79.1290, type:"Specialty Hospital",       phone:"+91-416-222-1971", address:"Vellore 632001" },
+];
 
-    if (!window.google?.maps) {
-      console.error("❌ Google Maps API not available");
-      setMapError("Google Maps not loaded. Check API key.");
-      return;
-    }
+function hav(lat1,lng1,lat2,lng2){
+  const R=6371,dLat=((lat2-lat1)*Math.PI)/180,dLng=((lng2-lng1)*Math.PI)/180;
+  const a=Math.sin(dLat/2)**2+Math.cos((lat1*Math.PI)/180)*Math.cos((lat2*Math.PI)/180)*Math.sin(dLng/2)**2;
+  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+function fmtD(km){return km<1?`${(km*1000).toFixed(0)} m`:`${km.toFixed(1)} km`;}
+function withDist(list,lat,lng){
+  return list.map(h=>{const d=hav(lat,lng,h.lat,h.lng);return{...h,distNum:d,dist:fmtD(d),time:`${Math.ceil(d*2.5)} min`};}).sort((a,b)=>a.distNum-b.distNum).slice(0,10);
+}
+async function overpass(lat,lng,r){
+  const q=`[out:json][timeout:20];(node["amenity"="hospital"](around:${r},${lat},${lng});way["amenity"="hospital"](around:${r},${lat},${lng});node["amenity"="clinic"](around:${r},${lat},${lng});node["healthcare"="hospital"](around:${r},${lat},${lng}););out body;>;out skel qt;`;
+  const res=await fetch("https://overpass-api.de/api/interpreter",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:`data=${encodeURIComponent(q)}`});
+  if(!res.ok)throw new Error(`HTTP ${res.status}`);
+  const d=await res.json();
+  return d.elements.filter(e=>e.lat&&e.lon&&e.tags?.name).map(e=>({id:String(e.id),name:e.tags.name,lat:e.lat,lng:e.lon,address:e.tags["addr:full"]||e.tags["addr:street"]||e.tags["addr:city"]||"See on map",type:e.tags.amenity==="hospital"?"Hospital":"Clinic",phone:e.tags.phone||e.tags["contact:phone"]||"Not listed"}));
+}
 
-    if (!location?.lat || !location?.lng) {
-      console.warn("⏳ Waiting for GPS location...");
-      setMapError("Waiting for your GPS location...");
-      return;
-    }
+function MapPage({location,locationCity}){
+  const mapRef=useRef(null),mapInst=useRef(null),uMarker=useRef(null),mRefs=useRef([]);
+  const [hospitals,setHospitals]=useState([]);
+  const [sel,setSel]=useState(null);
+  const [loading,setLoading]=useState(false);
+  const [status,setStatus]=useState("");
+  const [mapReady,setMapReady]=useState(false);
+  const [lfLoaded,setLfLoaded]=useState(!!window.L);
+  const [err,setErr]=useState(null);
+  const fetched=useRef(false);
 
-    const { lat, lng, accuracy } = location;
+  // Load Leaflet
+  useEffect(()=>{
+    if(window.L){setLfLoaded(true);return;}
+    const lk=document.createElement("link");lk.rel="stylesheet";lk.href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";document.head.appendChild(lk);
+    const sc=document.createElement("script");sc.src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";sc.onload=()=>setLfLoaded(true);sc.onerror=()=>setLfLoaded(true);document.head.appendChild(sc);
+  },[]);
 
-    const mapOptions = {
-      zoom: 15,
-      center: { lat, lng },
-      mapTypeControl: true,
-      fullscreenControl: true,
-      zoomControl: true,
-      streetViewControl: false,
-      keyboardShortcuts: false,
-      mapTypeId: "roadmap",
-      styles: [
-        { "elementType": "geometry", "stylers": [{ "color": "#1a1f3a" }] },
-        { "elementType": "labels.icon", "stylers": [{ "visibility": "off" }] },
-        { "elementType": "labels.text.fill", "stylers": [{ "color": "#8292b5" }] },
-        { "elementType": "labels.text.stroke", "stylers": [{ "color": "#0a0e27" }] },
-        { "featureType": "administrative", "elementType": "geometry.stroke", "stylers": [{ "color": "#2d3748" }] },
-        { "featureType": "administrative.country", "elementType": "labels.text.fill", "stylers": [{ "color": "#9ca3af" }] },
-        { "featureType": "administrative.land_parcel", "stylers": [{ "visibility": "off" }] },
-        { "featureType": "landscape.natural", "elementType": "geometry", "stylers": [{ "color": "#0f172a" }] },
-        { "featureType": "poi", "stylers": [{ "visibility": "off" }] },
-        { "featureType": "road", "elementType": "geometry.fill", "stylers": [{ "color": "#2d3748" }] },
-        { "featureType": "road", "elementType": "geometry.stroke", "stylers": [{ "visibility": "off" }] },
-        { "featureType": "road.arterial", "elementType": "geometry.fill", "stylers": [{ "color": "#3d4a5c" }] },
-        { "featureType": "road.highway", "elementType": "geometry.fill", "stylers": [{ "color": "#4a5f7f" }] },
-        { "featureType": "transit", "stylers": [{ "visibility": "off" }] },
-        { "featureType": "water", "elementType": "geometry.fill", "stylers": [{ "color": "#0d1628" }] }
-      ]
-    };
+  // Init map
+  useEffect(()=>{
+    if(!lfLoaded||!location?.lat||!mapRef.current||mapInst.current)return;
+    const L=window.L,{lat,lng}=location;
+    const map=L.map(mapRef.current,{center:[lat,lng],zoom:14,zoomControl:true,attributionControl:false});
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{maxZoom:19,subdomains:"abcd"}).addTo(map);
+    const ui=L.divIcon({className:"",html:`<div style="width:18px;height:18px;border-radius:50%;background:#1f91ff;border:3px solid #fff;box-shadow:0 0 0 8px rgba(31,145,255,0.2);"></div>`,iconSize:[18,18],iconAnchor:[9,9]});
+    uMarker.current=L.marker([lat,lng],{icon:ui,zIndexOffset:1000}).addTo(map).bindPopup("<b>You are here</b>");
+    mapInst.current=map;
+    setMapReady(true);
+  },[lfLoaded,location]);
 
-    try {
-      const map = new window.google.maps.Map(mapRef.current, mapOptions);
-      mapInstanceRef.current = map;
+  // Update user dot
+  useEffect(()=>{
+    if(!mapInst.current||!uMarker.current||!location?.lat)return;
+    uMarker.current.setLatLng([location.lat,location.lng]);
+  },[location?.lat,location?.lng]);
 
-      // Add traffic layer for real-time conditions
-      try {
-        const trafficLayer = new window.google.maps.TrafficLayer();
-        trafficLayer.setMap(map);
-        console.log("✅ Real-time traffic layer loaded");
-      } catch (e) {
-        console.warn("⚠️ Traffic layer unavailable");
+  // Fetch hospitals
+  useEffect(()=>{
+    if(!mapReady||!location?.lat||fetched.current)return;
+    fetched.current=true;
+    (async()=>{
+      setLoading(true);setErr(null);
+      const{lat,lng}=location;let list=[];
+      for(const r of[5000,15000,30000]){
+        try{setStatus(`Searching ${r/1000}km radius…`);const res=await overpass(lat,lng,r);if(res.length>0){list=withDist(res,lat,lng);break;}}
+        catch(e){console.warn("Overpass",r,e.message);}
       }
-
-      console.log(`✅ Map initialized at ${lat.toFixed(5)}, ${lng.toFixed(5)}`);
-      setMapError(null);
-    } catch (error) {
-      console.error("❌ Map initialization failed:", error);
-      setMapError(`Map error: ${error.message}`);
-    }
-  }, []);
-
-  // Update user location marker and recenter map
-  useEffect(() => {
-    if (!mapInstanceRef.current || !location?.lat || !location?.lng) return;
-
-    const { lat, lng, accuracy } = location;
-
-    // Update or create user location marker
-    if (userMarkerRef.current) {
-      userMarkerRef.current.setPosition({ lat, lng });
-    } else {
-      userMarkerRef.current = new window.google.maps.Marker({
-        position: { lat, lng },
-        map: mapInstanceRef.current,
-        title: "📍 Your Location",
-        icon: {
-          path: window.google.maps.SymbolPath.CIRCLE,
-          scale: 11,
-          fillColor: "#1f91ff",
-          fillOpacity: 1,
-          strokeColor: "#ffffff",
-          strokeWeight: 3
-        },
-        zIndex: 100,
-        animation: window.google.maps.Animation.DROP
+      if(list.length===0){setErr("Live search unavailable — showing known hospitals");list=withDist(FALLBACK_HOSPITALS,lat,lng);}
+      setHospitals(list);
+      const L=window.L;
+      mRefs.current.forEach(m=>mapInst.current.removeLayer(m));mRefs.current=[];
+      list.forEach((h,i)=>{
+        const ic=L.divIcon({className:"",html:`<div style="width:30px;height:30px;border-radius:50%;background:#ef4444;border:2.5px solid #fff;color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;box-shadow:0 3px 10px rgba(0,0,0,0.5);">${i+1}</div>`,iconSize:[30,30],iconAnchor:[15,15]});
+        const mk=L.marker([h.lat,h.lng],{icon:ic}).addTo(mapInst.current).on("click",()=>{setSel(h);mapInst.current.setView([h.lat,h.lng],16);});
+        mRefs.current.push(mk);
       });
-    }
+      if(list.length>0){
+        const pts=[[lat,lng],...list.slice(0,5).map(h=>[h.lat,h.lng])];
+        mapInst.current.fitBounds(L.latLngBounds(pts),{padding:[40,40]});
+      }
+      setLoading(false);setStatus("");
+    })();
+  },[mapReady,location]);
 
-    // Recenter map on user location
-    mapInstanceRef.current.panTo({ lat, lng });
+  const glass={background:"rgba(255,255,255,0.06)",backdropFilter:"blur(20px)",WebkitBackdropFilter:"blur(20px)",border:"1px solid rgba(255,255,255,0.12)"};
 
-    setLocationAccuracy(accuracy);
-    console.log(`📍 Location updated: ${lat.toFixed(5)}, ${lng.toFixed(5)} (±${accuracy.toFixed(0)}m)`);
-  }, [location]);
+  return(
+    <div style={{flex:1,display:"flex",flexDirection:"column",width:"100%",height:"100%",position:"relative",overflow:"hidden",background:"#0a0e27",paddingBottom:"75px"}}>
+      <style>{`.leaflet-container{background:#0a0e27!important}.leaflet-popup-content-wrapper{border-radius:10px!important}@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.9)}}@keyframes slideUp{from{transform:translateY(100%);opacity:0}to{transform:translateY(0);opacity:1}}@keyframes fadeIn{from{opacity:0}to{opacity:1}}`}</style>
 
-  // Load and update nearby hospitals
-  useEffect(() => {
-    if (!mapInstanceRef.current || !location?.lat || !location?.lng) return;
+      {/* Header */}
+      <div style={{background:"rgba(0,102,255,0.15)",borderBottom:"1px solid rgba(0,102,255,0.3)",padding:"10px 16px",display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+        <span style={{fontSize:"1.1rem"}}>📍</span>
+        <div style={{flex:1}}>
+          <p style={{margin:"0 0 1px",fontSize:"0.62rem",color:"rgba(255,255,255,0.45)",textTransform:"uppercase",fontWeight:600,letterSpacing:"0.1em"}}>Your Location</p>
+          <p style={{margin:0,fontSize:"0.95rem",color:"#fff",fontWeight:700}}>{locationCity||(location?`${location.lat.toFixed(4)}, ${location.lng.toFixed(4)}`:"Acquiring GPS…")}</p>
+        </div>
+        {location?.accuracy&&<div style={{background:"rgba(31,145,255,0.9)",color:"#fff",padding:"4px 10px",borderRadius:6,fontSize:"0.72rem",fontWeight:700}}>✓ GPS ±{location.accuracy.toFixed(0)}m</div>}
+      </div>
 
-    const loadHospitals = async () => {
-      setLoadingDistances(true);
-      const hospitals = getNearbyHospitals(location.lat, location.lng, 150);
+      {/* No GPS */}
+      {!location?.lat&&<div style={{position:"absolute",inset:0,top:52,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,background:"#0a0e27",zIndex:20}}>
+        <div style={{fontSize:"2.5rem"}}>📡</div>
+        <p style={{color:"#fff",fontWeight:600,fontSize:"1rem",margin:0}}>Acquiring GPS…</p>
+        <p style={{color:"#666",fontSize:"0.82rem",textAlign:"center",maxWidth:260,margin:0}}>Allow location access to find nearby hospitals.</p>
+        <div style={{width:36,height:36,borderRadius:"50%",border:"3px solid transparent",borderTopColor:"#1f91ff",animation:"spin 0.9s linear infinite"}}/>
+      </div>}
 
-      // Calculate distances using Haversine formula
-      const hospitalsWithDistances = hospitals.map((h) => {
-        const R = 6371; // Earth's radius in km
-        const dLat = ((h.lat - location.lat) * Math.PI) / 180;
-        const dLng = ((h.lng - location.lng) * Math.PI) / 180;
-        const a = 
-          Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-          Math.cos((location.lat * Math.PI) / 180) * 
-          Math.cos((h.lat * Math.PI) / 180) *
-          Math.sin(dLng / 2) * Math.sin(dLng / 2);
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        const distance = R * c;
-        
-        return {
-          ...h,
-          dist: distance < 1 ? `${(distance * 1000).toFixed(0)}m` : `${distance.toFixed(1)} km`,
-          time: `${Math.ceil(distance * 2.5)} min`,
-          distNum: distance
-        };
-      });
+      {/* Map */}
+      <div ref={mapRef} style={{flex:1,width:"100%",minHeight:0,position:"relative",zIndex:1}}/>
 
-      hospitalsWithDistances.sort((a, b) => a.distNum - b.distNum);
-      setNearbyHospitals(hospitalsWithDistances);
+      {/* Loading pill */}
+      {loading&&<div style={{position:"absolute",top:68,left:"50%",transform:"translateX(-50%)",...glass,borderRadius:20,padding:"8px 18px",display:"flex",alignItems:"center",gap:8,zIndex:50,fontSize:"0.73rem",color:"#fff",whiteSpace:"nowrap",animation:"fadeIn 0.3s ease"}}>
+        <div style={{width:8,height:8,borderRadius:"50%",background:"#1f91ff",animation:"pulse 0.85s ease-in-out infinite"}}/>
+        {status||"Finding hospitals…"}
+      </div>}
 
-      // Clear existing markers
-      markersRef.current.forEach(m => m.setMap(null));
-      markersRef.current = [];
+      {/* Error banner */}
+      {err&&!loading&&<div style={{position:"absolute",top:68,left:"50%",transform:"translateX(-50%)",background:"rgba(255,149,0,0.15)",border:"1px solid rgba(255,149,0,0.35)",borderRadius:10,padding:"6px 14px",fontSize:"0.7rem",color:"#ffd580",zIndex:50,whiteSpace:"nowrap",animation:"fadeIn 0.3s ease"}}>⚠ {err}</div>}
 
-      // Add hospital markers
-      hospitalsWithDistances.forEach((hospital, idx) => {
-        const marker = new window.google.maps.Marker({
-          position: { lat: hospital.lat, lng: hospital.lng },
-          map: mapInstanceRef.current,
-          title: hospital.name,
-          label: {
-            text: String(idx + 1),
-            color: "#fff",
-            fontSize: "11px",
-            fontWeight: "bold"
-          },
-          icon: {
-            path: window.google.maps.SymbolPath.CIRCLE,
-            scale: 13,
-            fillColor: "#ef4444",
-            fillOpacity: 0.92,
-            strokeColor: "#fff",
-            strokeWeight: 2
-          },
-          zIndex: idx + 1
-        });
-
-        marker.addListener("click", () => {
-          setSelectedHospital(hospital);
-          mapInstanceRef.current.setCenter({ lat: hospital.lat, lng: hospital.lng });
-          mapInstanceRef.current.setZoom(16);
-        });
-
-        markersRef.current.push(marker);
-      });
-
-      console.log(`✅ Updated ${hospitalsWithDistances.length} nearby hospitals`);
-      setLoadingDistances(false);
-    };
-
-    loadHospitals();
-  }, [location]);
-
-  return (
-    <div style={{
-      flex: 1,
-      display: "flex",
-      flexDirection: "column",
-      width: "100%",
-      height: "100%",
-      position: "relative",
-      overflow: "hidden",
-      background: "#0a0e27",
-      paddingBottom: "75px"
-    }}>
-      {/* Current Location Header */}
-      {location?.lat && (
-        <div style={{
-          background: "rgba(0, 102, 255, 0.15)",
-          borderBottom: "1px solid rgba(0, 102, 255, 0.3)",
-          padding: "12px 16px",
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          flexShrink: 0,
-        }}>
-          <div style={{fontSize: "1.2rem"}}>📍</div>
-          <div style={{flex: 1}}>
-            <p style={{margin: "0 0 2px", fontSize: "0.75rem", color: "rgba(255,255,255,0.6)", textTransform: "uppercase", fontWeight: 600}}>
-              Your Location
-            </p>
-            <p style={{margin: 0, fontSize: "0.9rem", color: "#fff", fontWeight: 600}}>
-              {locationCity || `${location.lat.toFixed(4)}, ${location.lng.toFixed(4)}`}
-            </p>
-          </div>
-          {locationAccuracy && (
-            <div style={{fontSize: "0.75rem", color: "rgba(0, 204, 255, 0.8)", fontWeight: 600}}>
-              ±{locationAccuracy.toFixed(0)}m
+      {/* Detail sheet */}
+      {sel&&<div style={{position:"fixed",bottom:75,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:480,background:"#fff",borderRadius:"20px 20px 0 0",boxShadow:"0 -8px 40px rgba(0,0,0,0.4)",zIndex:999,animation:"slideUp 0.3s ease-out",display:"flex",flexDirection:"column",maxHeight:"72vh",overflowY:"auto"}}>
+        <div style={{display:"flex",justifyContent:"center",padding:"12px 0 6px"}}><div style={{width:36,height:4,borderRadius:2,background:"#ddd"}}/></div>
+        <div style={{padding:"8px 16px 14px",borderBottom:"1px solid #f0f0f0",display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{display:"inline-flex",alignItems:"center",gap:5,background:"#fef2f2",border:"1px solid #fecaca",borderRadius:6,padding:"2px 8px",marginBottom:6}}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:"#ef4444"}}/>
+              <span style={{fontSize:"0.65rem",fontWeight:700,color:"#ef4444",letterSpacing:"0.06em"}}>#{hospitals.indexOf(sel)+1} NEAREST</span>
             </div>
-          )}
-        </div>
-      )}
-      
-      {/* Map Error/Status */}
-      {mapError && (
-        <div style={{
-          position: "absolute",
-          top: 0,
-          left: 0,
-          right: 0,
-          bottom: 0,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          background: "#0a0e27",
-          zIndex: 999,
-          flexDirection: "column",
-          gap: 16,
-          padding: 20,
-          textAlign: "center"
-        }}>
-          <div style={{fontSize: "2.5rem"}}>📍</div>
-          <p style={{color: "#fff", fontSize: "1rem", fontWeight: 600}}>
-            {mapError.includes("Waiting") ? "Acquiring GPS..." : "Location Error"}
-          </p>
-          <p style={{color: "#888", fontSize: "0.9rem", maxWidth: 300}}>
-            {mapError}
-          </p>
-          {locationAccuracy && (
-            <p style={{color: "#666", fontSize: "0.8rem"}}>
-              Accuracy: ±{locationAccuracy.toFixed(0)}m
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* Google Map Container */}
-      <div
-        ref={mapRef}
-        style={{
-          flex: 1,
-          width: "100%",
-          height: "100%",
-          position: "relative",
-          background: "#0a0e27"
-        }}
-      />
-
-      {/* Location Accuracy Badge */}
-      {location?.lat && locationAccuracy && (
-        <div style={{
-          position: "absolute",
-          top: 16,
-          right: 16,
-          background: "rgba(31, 145, 255, 0.95)",
-          color: "#fff",
-          padding: "8px 12px",
-          borderRadius: "8px",
-          fontSize: "0.8rem",
-          fontWeight: 600,
-          backdropFilter: "blur(8px)",
-          zIndex: 40
-        }}>
-          ✓ GPS ±{locationAccuracy.toFixed(0)}m
-        </div>
-      )}
-
-      {/* Hospital Details Popup - Responsive */}
-      {selectedHospital && (
-        <div style={{
-          position: "fixed",
-          bottom: "75px",
-          left: "50%",
-          transform: "translateX(-50%)",
-          width: "100%",
-          maxWidth: "480px",
-          background: "#fff",
-          borderRadius: "20px 20px 0 0",
-          boxShadow: "0 -8px 32px rgba(0,0,0,0.3)",
-          maxHeight: "85vh",
-          height: "auto",
-          overflowY: "auto",
-          overflowX: "hidden",
-          zIndex: 999,
-          animation: "slideUp 0.3s ease-out",
-          display: "flex",
-          flexDirection: "column",
-          boxSizing: "border-box"
-        }}>
-          {/* Handle Bar */}
-          <div style={{
-            display: "flex",
-            justifyContent: "center",
-            padding: "12px 0 8px",
-            borderBottom: "1px solid #e8e8e8",
-            flexShrink: 0
-          }}>
-            <div style={{
-              height: "4px",
-              background: "#d9d9d9",
-              borderRadius: "2px",
-              width: "32px"
-            }}></div>
+            <h2 style={{margin:"0 0 3px",fontSize:"1.05rem",fontWeight:700,color:"#000",wordBreak:"break-word",lineHeight:1.3}}>{sel.name}</h2>
+            <p style={{margin:0,fontSize:"0.78rem",color:"#888"}}>{sel.type}</p>
           </div>
-
-          {/* Header */}
-          <div style={{
-            padding: "14px 12px 10px",
-            borderBottom: "1px solid #e8e8e8",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "flex-start",
-            gap: 8,
-            flexShrink: 0,
-            overflowX: "hidden",
-            boxSizing: "border-box",
-            width: "100%"
-          }}>
-            <div style={{flex: 1, minWidth: 0}}>
-              <h2 style={{
-                margin: "0 0 4px",
-                fontSize: "1.05rem",
-                fontWeight: 700,
-                color: "#000",
-                wordWrap: "break-word",
-                wordBreak: "break-word",
-                overflowWrap: "break-word"
-              }}>
-                {selectedHospital.name}
-              </h2>
-              <p style={{
-                margin: "0 0 6px",
-                fontSize: "0.8rem",
-                color: "#666",
-                wordWrap: "break-word"
-              }}>
-                {selectedHospital.type}
-              </p>
-              <div style={{display: "flex", alignItems: "center", gap: 4}}>
-                <span style={{color: "#fbbc04", fontSize: "0.8rem"}}>★</span>
-                <span style={{fontSize: "0.75rem", color: "#666", fontWeight: 500}}>
-                  {selectedHospital.rating || "4.5"} • {selectedHospital.city}
-                </span>
+          <button onClick={()=>setSel(null)} style={{background:"#f5f5f5",border:"none",borderRadius:"50%",width:30,height:30,cursor:"pointer",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"0.85rem",color:"#555"}}>✕</button>
+        </div>
+        <div style={{padding:"12px 16px",display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,borderBottom:"1px solid #f0f0f0"}}>
+          {[{icon:"📍",label:"Distance",value:sel.dist},{icon:"⏱",label:"Est. Drive",value:sel.time}].map(({icon,label,value})=>(
+            <div key={label} style={{background:"#f8faff",borderRadius:10,padding:"10px 12px"}}>
+              <p style={{margin:"0 0 3px",fontSize:"0.62rem",color:"#999",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.07em"}}>{icon} {label}</p>
+              <p style={{margin:0,fontSize:"1.05rem",fontWeight:700,color:"#1f91ff"}}>{value}</p>
+            </div>
+          ))}
+        </div>
+        <div style={{padding:"12px 16px",display:"flex",flexDirection:"column",gap:8}}>
+          {[{icon:"🏠",label:"Address",value:sel.address},{icon:"📞",label:"Phone",value:sel.phone,mono:true}].map(({icon,label,value,mono})=>(
+            <div key={label} style={{background:"#f8faff",borderRadius:8,padding:"9px 12px",display:"flex",alignItems:"flex-start",gap:8}}>
+              <span style={{flexShrink:0,fontSize:"0.9rem"}}>{icon}</span>
+              <div style={{flex:1,minWidth:0}}>
+                <p style={{margin:"0 0 2px",fontSize:"0.6rem",color:"#999",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.07em"}}>{label}</p>
+                <p style={{margin:0,fontSize:"0.8rem",color:mono?"#1f91ff":"#333",fontFamily:mono?"monospace":"inherit",fontWeight:mono?600:400,wordBreak:"break-word",lineHeight:1.4}}>{value}</p>
               </div>
             </div>
-            <button
-              onClick={() => setSelectedHospital(null)}
-              style={{
-                background: "none",
-                border: "none",
-                fontSize: "1.3rem",
-                cursor: "pointer",
-                color: "#666",
-                padding: 0,
-                minWidth: "28px",
-                width: 28,
-                height: 28,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                transition: "color 0.2s",
-                flexShrink: 0
-              }}
-              onMouseEnter={(e) => { e.currentTarget.style.color = "#000"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.color = "#666"; }}
-            >
-              ✕
-            </button>
-          </div>
-
-          {/* Info Grid */}
-          <div style={{
-            padding: "12px 12px",
-            display: "flex",
-            flexDirection: "column",
-            gap: 8,
-            borderBottom: "1px solid #e8e8e8",
-            overflowX: "hidden",
-            boxSizing: "border-box",
-            width: "100%"
-          }}>
-            {/* Distance & Duration */}
-            <div style={{
-              display: "grid",
-              gridTemplateColumns: "1fr 1fr",
-              gap: 8,
-              width: "100%",
-              boxSizing: "border-box"
-            }}>
-              <div style={{
-                padding: "8px",
-                background: "#f8f9fa",
-                borderRadius: "8px",
-                textAlign: "center",
-                overflow: "hidden",
-                boxSizing: "border-box",
-                minWidth: 0
-              }}>
-                <p style={{margin: "0 0 4px", fontSize: "0.65rem", color: "#666", fontWeight: 600, textTransform: "uppercase"}}>
-                  Distance
-                </p>
-                <p style={{margin: 0, fontSize: "0.95rem", fontWeight: 700, color: "#1f91ff", wordWrap: "break-word", overflow: "hidden", textOverflow: "ellipsis"}}>
-                  {selectedHospital.dist}
-                </p>
-              </div>
-              <div style={{
-                padding: "8px",
-                background: "#f8f9fa",
-                borderRadius: "8px",
-                textAlign: "center",
-                overflow: "hidden",
-                boxSizing: "border-box",
-                minWidth: 0
-              }}>
-                <p style={{margin: "0 0 4px", fontSize: "0.65rem", color: "#666", fontWeight: 600, textTransform: "uppercase"}}>
-                  Duration
-                </p>
-                <p style={{margin: 0, fontSize: "0.95rem", fontWeight: 700, color: "#1f91ff", wordWrap: "break-word", overflow: "hidden", textOverflow: "ellipsis"}}>
-                  {selectedHospital.time}
-                </p>
-              </div>
-            </div>
-
-            {/* Location */}
-            <div style={{
-              display: "flex",
-              alignItems: "flex-start",
-              gap: 8,
-              padding: "8px",
-              background: "#f8f9fa",
-              borderRadius: "8px",
-              overflowX: "hidden",
-              boxSizing: "border-box",
-              minWidth: 0
-            }}>
-              <span style={{fontSize: "0.9rem", marginTop: "2px", flexShrink: 0}}>📍</span>
-              <div style={{flex: 1, minWidth: 0, overflowX: "hidden"}}>
-                <p style={{margin: "0 0 2px", fontSize: "0.65rem", color: "#666", fontWeight: 600, textTransform: "uppercase"}}>
-                  Address
-                </p>
-                <p style={{margin: 0, fontSize: "0.8rem", color: "#000", lineHeight: "1.3", wordWrap: "break-word", wordBreak: "break-word", overflowWrap: "break-word"}}>
-                  {selectedHospital.address}
-                </p>
-              </div>
-            </div>
-
-            {/* Phone */}
-            <div style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              padding: "8px",
-              background: "#f8f9fa",
-              borderRadius: "8px",
-              overflowX: "hidden",
-              boxSizing: "border-box",
-              minWidth: 0
-            }}>
-              <span style={{fontSize: "0.9rem", flexShrink: 0}}>📞</span>
-              <div style={{flex: 1, minWidth: 0, overflowX: "hidden"}}>
-                <p style={{margin: "0 0 2px", fontSize: "0.65rem", color: "#666", fontWeight: 600, textTransform: "uppercase"}}>
-                  Contact
-                </p>
-                <p style={{margin: 0, fontSize: "0.8rem", color: "#1f91ff", fontWeight: 600, fontFamily: "monospace", wordWrap: "break-word", overflowWrap: "break-word", overflow: "hidden", textOverflow: "ellipsis"}}>
-                  {selectedHospital.phone}
-                </p>
-              </div>
-            </div>
-          </div>
-
-          {/* Action Buttons - Responsive */}
-          <div style={{
-            padding: "12px 12px 16px",
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr",
-            gap: 8,
-            width: "100%",
-            overflowX: "hidden",
-            flexShrink: 0,
-            boxSizing: "border-box"
-          }}>
-            {/* Call Button */}
-            <a 
-              href={`tel:${selectedHospital.phone.replace(/[^\d+]/g, '')}`}
-              style={{
-                padding: "10px 6px",
-                background: "#ef4444",
-                color: "#fff",
-                textDecoration: "none",
-                borderRadius: "8px",
-                textAlign: "center",
-                fontWeight: 700,
-                fontSize: "0.85rem",
-                border: "none",
-                cursor: "pointer",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 4,
-                transition: "background 0.2s",
-                wordBreak: "break-word",
-                overflow: "hidden",
-                boxSizing: "border-box",
-                minWidth: 0
-              }}
-              onMouseEnter={(e) => { e.currentTarget.style.background = "#dc2626"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "#ef4444"; }}
-            >
-              📞 Call
-            </a>
-
-            {/* Google Maps Directions Button */}
-            <a 
-              href={`https://www.google.com/maps/dir/?api=1&destination=${selectedHospital.lat},${selectedHospital.lng}&travelmode=driving`}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{
-                padding: "10px 6px",
-                background: "#1f91ff",
-                color: "#fff",
-                textDecoration: "none",
-                borderRadius: "8px",
-                textAlign: "center",
-                fontWeight: 700,
-                fontSize: "0.85rem",
-                border: "none",
-                cursor: "pointer",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 4,
-                transition: "background 0.2s",
-                wordBreak: "break-word",
-                overflow: "hidden",
-                boxSizing: "border-box",
-                minWidth: 0
-              }}
-              onMouseEnter={(e) => { e.currentTarget.style.background = "#0d6be8"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "#1f91ff"; }}
-            >
-              🗺️ Route
-            </a>
-          </div>
+          ))}
         </div>
-      )}
-
-      {/* Hospital List - Responsive */}
-      {!selectedHospital && nearbyHospitals.length > 0 && (
-        <div style={{
-          position: "fixed",
-          bottom: "75px",
-          left: "50%",
-          transform: "translateX(-50%)",
-          width: "100%",
-          maxWidth: "480px",
-          background: "#fff",
-          borderRadius: "16px 16px 0 0",
-          maxHeight: "55vh",
-          overflowY: "auto",
-          overflowX: "hidden",
-          boxShadow: "0 -4px 16px rgba(0,0,0,0.2)",
-          zIndex: 40,
-          animation: "slideUp 0.3s ease-out",
-          display: "flex",
-          flexDirection: "column",
-          boxSizing: "border-box"
-        }}>
-          {/* Handle Bar */}
-          <div style={{
-            display: "flex",
-            justifyContent: "center",
-            padding: "12px 0 8px",
-            borderBottom: "1px solid #e8e8e8",
-            flexShrink: 0
-          }}>
-            <div style={{
-              height: "4px",
-              background: "#d9d9d9",
-              borderRadius: "2px",
-              width: "32px"
-            }}></div>
-          </div>
-
-          {/* Header */}
-          <div style={{
-            padding: "12px 16px",
-            borderBottom: "1px solid #e8e8e8",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            background: "#f8f9fa",
-            flexShrink: 0,
-            overflowX: "hidden"
-          }}>
-            <h3 style={{margin: 0, fontSize: "0.9rem", fontWeight: 700, color: "#000", overflow: "hidden", textOverflow: "ellipsis"}}>
-              🏥 Nearby Trauma Centers
-            </h3>
-            <span style={{
-              background: "#1f91ff",
-              color: "#fff",
-              borderRadius: "50%",
-              minWidth: "28px",
-              width: 28,
-              height: 28,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              fontWeight: 700,
-              fontSize: "0.8rem",
-              flexShrink: 0
-            }}>
-              {nearbyHospitals.length}
-            </span>
-          </div>
-
-          {/* Hospital Items */}
-          <div style={{padding: "8px 0", flex: 1, overflowY: "auto", overflowX: "hidden", width: "100%"}}>
-            {loadingDistances ? (
-              <div style={{padding: "20px", textAlign: "center", color: "#666"}}>
-                <div style={{fontSize: "1.5rem", marginBottom: 8}}>⟳</div>
-                <p style={{margin: 0, fontSize: "0.9rem"}}>Updating locations...</p>
-              </div>
-            ) : (
-              nearbyHospitals.map((h, idx) => (
-                <button
-                  key={idx}
-                  onClick={() => setSelectedHospital(h)}
-                  style={{
-                    width: "100%",
-                    padding: "12px 14px",
-                    borderBottom: "1px solid #f0f0f0",
-                    cursor: "pointer",
-                    transition: "background 0.2s, border 0.2s",
-                    background: "transparent",
-                    border: "none",
-                    textAlign: "left",
-                    display: "flex",
-                    gap: 10,
-                    overflowX: "hidden",
-                    boxSizing: "border-box"
-                  }}
-                  onMouseEnter={(e) => { 
-                    e.currentTarget.style.background = "#f8f9fa";
-                    e.currentTarget.style.borderColor = "#e0e0e0";
-                  }}
-                  onMouseLeave={(e) => { 
-                    e.currentTarget.style.background = "transparent";
-                    e.currentTarget.style.borderColor = "#f0f0f0";
-                  }}
-                >
-                  {/* Hospital Index Badge */}
-                  <div style={{
-                    background: "#ef4444",
-                    color: "#fff",
-                    minWidth: "30px",
-                    width: 30,
-                    height: 30,
-                    borderRadius: "50%",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontWeight: "bold",
-                    fontSize: "0.8rem",
-                    flexShrink: 0
-                  }}>
-                    {idx + 1}
-                  </div>
-
-                  {/* Hospital Info */}
-                  <div style={{flex: 1, minWidth: 0, overflowX: "hidden"}}>
-                    <h4 style={{margin: "0 0 2px", fontSize: "0.9rem", fontWeight: 600, color: "#000", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", wordBreak: "break-word"}}>
-                      {h.name}
-                    </h4>
-                    <p style={{margin: "0 0 4px", fontSize: "0.75rem", color: "#666", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"}}>
-                      {h.type}
-                    </p>
-                    <div style={{display: "flex", gap: 10, fontSize: "0.75rem", color: "#1f91ff", fontWeight: 600, overflow: "hidden"}}>
-                      <span style={{whiteSpace: "nowrap"}}>📍 {h.dist}</span>
-                      <span style={{whiteSpace: "nowrap"}}>⏱️ {h.time}</span>
-                    </div>
-                  </div>
-
-                  {/* Arrow Indicator */}
-                  <div style={{
-                    color: "#ccc",
-                    fontSize: "1.1rem",
-                    display: "flex",
-                    alignItems: "center",
-                    flexShrink: 0
-                  }}>
-                    →
-                  </div>
-                </button>
-              ))
-            )}
-          </div>
+        <div style={{padding:"0 16px 20px",display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <a href={`tel:${sel.phone.replace(/[^\d+]/g,"")}`} style={{padding:"13px 8px",background:"#ef4444",color:"#fff",textDecoration:"none",borderRadius:10,textAlign:"center",fontWeight:700,fontSize:"0.875rem",display:"flex",alignItems:"center",justifyContent:"center",gap:5}}>📞 Call Now</a>
+          <a href={`https://www.google.com/maps/dir/?api=1&destination=${sel.lat},${sel.lng}&travelmode=driving`} target="_blank" rel="noopener noreferrer" style={{padding:"13px 8px",background:"#1f91ff",color:"#fff",textDecoration:"none",borderRadius:10,textAlign:"center",fontWeight:700,fontSize:"0.875rem",display:"flex",alignItems:"center",justifyContent:"center",gap:5}}>🗺️ Directions</a>
         </div>
-      )}
+      </div>}
 
-      {/* No Hospitals Found */}
-      {!loadingDistances && nearbyHospitals.length === 0 && location?.lat && (
-        <div style={{
-          position: "absolute",
-          bottom: 0,
-          left: 0,
-          right: 0,
-          background: "#fff",
-          borderRadius: "16px 16px 0 0",
-          padding: "24px",
-          textAlign: "center",
-          zIndex: 40
-        }}>
-          <div style={{fontSize: "2rem", marginBottom: 8}}>🏥</div>
-          <p style={{margin: "0 0 4px", fontSize: "0.9rem", fontWeight: 600, color: "#000"}}>
-            No trauma centers found
-          </p>
-          <p style={{margin: 0, fontSize: "0.85rem", color: "#666"}}>
-            Expanding search radius... Try moving to a populated area
-          </p>
+      {/* Hospital list */}
+      {!sel&&hospitals.length>0&&<div style={{position:"fixed",bottom:75,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:480,background:"#fff",borderRadius:"18px 18px 0 0",maxHeight:"44vh",overflowY:"auto",boxShadow:"0 -4px 24px rgba(0,0,0,0.25)",zIndex:40,animation:"slideUp 0.35s ease-out"}}>
+        <div style={{display:"flex",justifyContent:"center",padding:"10px 0 6px"}}><div style={{width:36,height:4,borderRadius:2,background:"#ddd"}}/></div>
+        <div style={{padding:"6px 16px 10px",borderBottom:"1px solid #f0f0f0",display:"flex",justifyContent:"space-between",alignItems:"center",background:"#f9fafb"}}>
+          <div>
+            <h3 style={{margin:0,fontSize:"0.9rem",fontWeight:700,color:"#111"}}>🏥 Nearest Hospitals</h3>
+            <p style={{margin:"2px 0 0",fontSize:"0.68rem",color:"#999"}}>Tap any hospital for details & directions</p>
+          </div>
+          <span style={{background:"#ef4444",color:"#fff",borderRadius:"50%",width:26,height:26,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:"0.75rem"}}>{hospitals.length}</span>
         </div>
-      )}
+        <div style={{padding:"8px 16px",background:"#fef2f2",borderBottom:"1px solid #fee2e2",display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+          <span style={{fontSize:"0.75rem",fontWeight:700,color:"#ef4444"}}>🚨 Emergency:</span>
+          {[{label:"Ambulance",num:"102"},{label:"Emergency",num:"112"}].map(({label,num})=>(
+            <a key={num} href={`tel:${num}`} style={{background:"#ef4444",color:"#fff",padding:"3px 10px",borderRadius:20,fontSize:"0.72rem",fontWeight:700,textDecoration:"none"}}>{num} {label}</a>
+          ))}
+        </div>
+        {hospitals.map((h,i)=>(
+          <button key={h.id} onClick={()=>{setSel(h);mapInst.current?.setView([h.lat,h.lng],16);}}
+            style={{width:"100%",padding:"12px 16px",borderBottom:"1px solid #f5f5f5",cursor:"pointer",background:"transparent",border:"none",textAlign:"left",display:"flex",alignItems:"center",gap:12,transition:"background 0.15s"}}
+            onMouseEnter={e=>{e.currentTarget.style.background="#f9fafb";}} onMouseLeave={e=>{e.currentTarget.style.background="transparent";}}>
+            <div style={{background:i===0?"#ef4444":i<=2?"#f97316":"#6b7280",color:"#fff",width:30,height:30,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:"0.78rem",flexShrink:0}}>{i+1}</div>
+            <div style={{flex:1,minWidth:0}}>
+              <p style={{margin:"0 0 2px",fontSize:"0.875rem",fontWeight:600,color:"#000",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{h.name}</p>
+              <p style={{margin:0,fontSize:"0.7rem",color:"#888"}}>{h.type}</p>
+            </div>
+            <div style={{textAlign:"right",flexShrink:0}}>
+              <p style={{margin:"0 0 1px",fontSize:"0.82rem",color:"#1f91ff",fontWeight:700}}>{h.dist}</p>
+              <p style={{margin:0,fontSize:"0.67rem",color:"#bbb"}}>⏱ {h.time}</p>
+            </div>
+            <span style={{color:"#ccc",fontSize:"1.2rem",flexShrink:0}}>›</span>
+          </button>
+        ))}
+      </div>}
+
+      {/* No results */}
+      {!loading&&hospitals.length===0&&location?.lat&&<div style={{position:"absolute",bottom:0,left:0,right:0,background:"#fff",borderRadius:"16px 16px 0 0",padding:"24px",textAlign:"center",zIndex:40}}>
+        <div style={{fontSize:"2rem",marginBottom:8}}>🏥</div>
+        <p style={{margin:"0 0 4px",fontSize:"0.9rem",fontWeight:600,color:"#000"}}>No hospitals found</p>
+        <p style={{margin:0,fontSize:"0.82rem",color:"#666"}}>Check your connection and try again.</p>
+      </div>}
     </div>
   );
 }
+
 
 // ─── Chat Page ────────────────────────────────────────────────────────────────
 function ChatPage() {
@@ -2765,16 +2352,53 @@ function HomePage({ setPage }) {
 }
 
 // ─── Camera Page ──────────────────────────────────────────────────────────────
-function CameraPage({ onResult, latestResult }) {
+function CameraPage({ onResult, latestResult, setPage }) {
   const [cameraError, setCameraError] = useState(null);
   const [showPanel, setShowPanel] = useState(false);
+  const [backendStatus, setBackendStatus] = useState("checking"); // "checking" | "online" | "offline"
+
+  // Check backend health on mount
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const res = await fetch("/api/health", { method: "GET", signal: AbortSignal.timeout(3000) });
+        setBackendStatus(res.ok ? "online" : "offline");
+      } catch {
+        setBackendStatus("offline");
+      }
+    };
+    check();
+  }, []);
 
   useEffect(() => {
     if (latestResult) setShowPanel(true);
   }, [latestResult]);
 
+  const statusBar = {
+    checking: { bg: "rgba(255,149,0,0.15)", border: "rgba(255,149,0,0.4)", color: "#ffb84d", text: "⏳ Checking backend..." },
+    online:   { bg: "rgba(0,204,136,0.12)", border: "rgba(0,204,136,0.35)", color: "#66dd99", text: "✅ Backend online — ready to scan" },
+    offline:  { bg: "rgba(255,59,48,0.15)",  border: "rgba(255,59,48,0.4)",  color: "#ff9999", text: "❌ Backend offline — run: cd VLM && uvicorn main:app --reload" },
+  }[backendStatus];
+
   return (
     <div style={{flex:1,display:"flex",flexDirection:"column",position:"relative",background:"#000"}}>
+
+      {/* Backend status banner */}
+      <div style={{
+        position:"absolute",top:12,left:12,right:12,zIndex:30,
+        background: statusBar.bg,
+        border: `1px solid ${statusBar.border}`,
+        borderRadius: 10,
+        padding: "7px 12px",
+        fontSize: "0.7rem",
+        color: statusBar.color,
+        fontWeight: 600,
+        letterSpacing: "0.04em",
+        backdropFilter: "blur(8px)",
+      }}>
+        {statusBar.text}
+      </div>
+
       {/* Full-screen camera */}
       <div style={{flex:1,position:"relative"}}>
         {cameraError ? (
@@ -2792,6 +2416,7 @@ function CameraPage({ onResult, latestResult }) {
             </p>
           </div>
         ) : (
+          
           <CameraFeed onResult={onResult} onError={setCameraError}/>
         )}
       </div>
@@ -2860,66 +2485,161 @@ function CameraPage({ onResult, latestResult }) {
   );
 }
 
-// ─── Result Page ──────────────────────────────────────────────────────────────
-function ResultPage({ result, onSeverityUpdate }) {
-  const { speak, replay } = useVoiceSpeech();
+function ResultPanel({ result, onSeverityUpdate }) {
+  if (!result) return (
+    <div style={{...glassCard,padding:"2rem",textAlign:"center"}}>
+      <div style={{color:"rgba(255,255,255,0.15)",marginBottom:"1rem",fontSize:"2rem"}}>◎</div>
+      <p style={{color:"rgba(255,255,255,0.3)",fontSize:"0.875rem",letterSpacing:"0.05em"}}>
+        Awaiting detection results...
+      </p>
+    </div>
+  );
 
-  // Auto-speak when result arrives
-  useEffect(() => {
-    if (result) {
-      const text = `${result.severity} alert. ${result.injury} detected. ${result.instructions[0]}. ${result.instructions[1]}.`;
-      speak(text);
-    }
-  }, [result, speak]);
+  const sevKey = result.severity?.toLowerCase();
+  const colors = COLORS[sevKey] || COLORS.low;
 
   return (
     <div style={{
-      flex:1,overflowY:"auto",
-      background:"linear-gradient(160deg,#0a0e27 0%,#1a1f3a 100%)",
-      padding:"1rem 1rem 80px 1rem",display:"flex",flexDirection:"column",gap:"1rem",
+      ...glassCard,
+      borderColor: `${colors.accent}30`,
+      background: `${colors.bg}cc`,
+      padding:"1.25rem",
     }}>
-      {/* Header */}
-      <div style={{
-        display:"flex",alignItems:"center",gap:10,
-        padding:"0.5rem 0",
-      }}>
+      {/* Low confidence warning banner */}
+      {result.low_confidence && (
         <div style={{
-          width:32,height:32,borderRadius:10,
-          background:"rgba(129,140,248,0.15)",
-          display:"flex",alignItems:"center",justifyContent:"center",
-          color:"#818cf8",
+          background:"rgba(255,149,0,0.12)",
+          border:"1px solid rgba(255,149,0,0.35)",
+          borderRadius:10,padding:"8px 12px",
+          marginBottom:"0.75rem",
+          display:"flex",alignItems:"center",gap:8,
         }}>
-          <Icons.Activity/>
+          <span style={{fontSize:"1rem"}}>⚠️</span>
+          <div>
+            <p style={{margin:0,fontSize:"0.72rem",fontWeight:700,color:"#ffb84d",letterSpacing:"0.04em"}}>
+              LOW CONFIDENCE SCAN
+            </p>
+            <p style={{margin:0,fontSize:"0.68rem",color:"rgba(255,255,255,0.5)",marginTop:2}}>
+              Better lighting or a closer shot will improve accuracy
+            </p>
+          </div>
         </div>
+      )}
+
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:"1rem"}}>
         <div>
-          <h2 style={{margin:0,fontSize:"1.1rem",fontWeight:700,color:"rgba(255,255,255,0.95)"}}>
-            Analysis Results
-          </h2>
-          <p style={{margin:0,fontSize:"0.7rem",color:"rgba(255,255,255,0.35)",letterSpacing:"0.06em"}}>
-            {result ? "DETECTION COMPLETE" : "AWAITING SCAN"}
+          <div style={{
+            display:"inline-flex",alignItems:"center",gap:6,
+            background:`${colors.accent}20`,
+            border:`1px solid ${colors.accent}40`,
+            padding:"3px 10px",borderRadius:20,
+            fontSize:"0.65rem",fontWeight:700,color:colors.text,
+            letterSpacing:"0.12em",marginBottom:8,
+          }}>
+            <div style={{
+              width:6,height:6,borderRadius:"50%",
+              background:colors.accent,
+              animation: result.severity === "CRITICAL" ? "pulse 1s ease-in-out infinite" : "none",
+            }}/>
+            {result.severity}
+          </div>
+          <h3 style={{
+            fontSize:"1.25rem",fontWeight:700,
+            color:"rgba(255,255,255,0.95)",margin:0,
+          }}>{result.injury}</h3>
+          <p style={{
+            fontSize:"0.75rem",color:"rgba(255,255,255,0.4)",
+            marginTop:4,letterSpacing:"0.05em",
+          }}>
+            Region: {result.region} · Confidence: {result.confidence}%
           </p>
         </div>
-      </div>
-
-      <ResultPanel result={result} onSeverityUpdate={onSeverityUpdate}/>
-      <VoiceGuide result={result} onReplay={replay} onStop={stop}/>
-      {result && <QnAPanel result={result} onSeverityUpdate={onSeverityUpdate}/>}
-
-      {/* Info disclaimer */}
-      <div style={{
-        ...glassCard,padding:"12px",
-        display:"flex",gap:10,alignItems:"flex-start",
-      }}>
-        <div style={{color:"rgba(255,255,255,0.3)",flexShrink:0,marginTop:1}}>
-          <Icons.Info/>
+        <div style={{
+          width:48,height:48,borderRadius:"50%",
+          background:`${colors.accent}15`,
+          border:`2px solid ${colors.accent}40`,
+          display:"flex",alignItems:"center",justifyContent:"center",
+          color:colors.accent,
+          boxShadow:`0 0 20px ${colors.glow}`,
+        }}>
+          <Icons.AlertTriangle/>
         </div>
-        <p style={{fontSize:"0.7rem",color:"rgba(255,255,255,0.3)",lineHeight:1.5,margin:0}}>
-          AI detection is for guidance only and does not replace professional medical assessment. Call 112 (Emergency), 100 (Police), or 102 (Ambulance) in India for critical situations.
-        </p>
       </div>
+
+      {/* Severity bar */}
+      <div style={{marginBottom:"1.25rem"}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+          <span style={{fontSize:"0.65rem",color:"rgba(255,255,255,0.35)",letterSpacing:"0.1em"}}>
+            SEVERITY LEVEL
+          </span>
+          <span style={{fontSize:"0.65rem",color:colors.text,fontWeight:700,letterSpacing:"0.1em"}}>
+            {result.severity}
+          </span>
+        </div>
+        <div style={{height:4,background:"rgba(255,255,255,0.06)",borderRadius:2,overflow:"hidden"}}>
+          <div style={{
+            height:"100%",borderRadius:2,
+            background:`linear-gradient(90deg,${colors.accent}80,${colors.accent})`,
+            width: result.severity==="CRITICAL" ? "100%" : result.severity==="MODERATE" ? "60%" : "30%",
+            transition:"width 1s ease",
+            boxShadow:`0 0 8px ${colors.glow}`,
+          }}/>
+        </div>
+      </div>
+
+      {/* Instructions */}
+      <div>
+        <p style={{
+          fontSize:"0.7rem",fontWeight:600,letterSpacing:"0.1em",
+          color:"rgba(255,255,255,0.5)",marginBottom:"0.75rem",
+        }}>
+          EMERGENCY INSTRUCTIONS
+        </p>
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {result.instructions.map((step, i) => (
+            <div key={i} style={{
+              display:"flex",alignItems:"flex-start",gap:10,
+              padding:"8px 10px",
+              background:"rgba(255,255,255,0.03)",
+              border:"1px solid rgba(255,255,255,0.05)",
+              borderRadius:10,
+            }}>
+              <span style={{
+                flexShrink:0,width:20,height:20,borderRadius:6,
+                background:`${colors.accent}20`,
+                display:"flex",alignItems:"center",justifyContent:"center",
+                fontSize:"0.65rem",fontWeight:700,color:colors.text,
+              }}>{i+1}</span>
+              <span style={{fontSize:"0.8rem",color:"rgba(255,255,255,0.75)",lineHeight:1.5}}>
+                {step}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Emergency call button */}
+      <button style={{
+        width:"100%",marginTop:"1rem",padding:"12px",
+        background:"rgba(239,68,68,0.15)",
+        border:"1px solid rgba(239,68,68,0.4)",
+        borderRadius:12,
+        display:"flex",alignItems:"center",justifyContent:"center",gap:8,
+        color:"#fca5a5",fontWeight:700,fontSize:"0.875rem",
+        cursor:"pointer",letterSpacing:"0.05em",
+        transition:"all 0.15s",
+      }}
+      onMouseEnter={e => e.currentTarget.style.background="rgba(239,68,68,0.25)"}
+      onMouseLeave={e => e.currentTarget.style.background="rgba(239,68,68,0.15)"}
+      onClick={() => window.location.href = "tel:112"}
+      >
+        <Icons.Phone/> CALL 112 (EMERGENCY)
+      </button>
     </div>
   );
 }
+
 
 // ─── Root App ─────────────────────────────────────────────────────────────────
 export default function App() {
@@ -2929,7 +2649,8 @@ export default function App() {
   const [location, setLocation] = useState(null);
   const [locationCity, setLocationCity] = useState(null);
   const [showLocationEditor, setShowLocationEditor] = useState(false);
-  const [locationStatus, setLocationStatus] = useState("waiting"); // waiting, tracking, error
+  const [locationStatus, setLocationStatus] = useState("waiting");
+  const [assessmentComplete, setAssessmentComplete] = useState(false); // waiting, tracking, error
   const watchIdRef = useRef(null);
 
   // Real-time location tracking with watchPosition
@@ -2998,9 +2719,11 @@ export default function App() {
   }, []);
 
   const handleDetectionResult = useCallback((result) => {
-    setDetectionResult(result);
-    setSeverity(result.severity);
-  }, []);
+  setDetectionResult(result);
+  setSeverity(result.severity);
+  setAssessmentComplete(false); // reset for new scan
+  setPage("result");
+}, []);
 
   const handleSeverityUpdate = useCallback((newSeverity) => {
     setSeverity(newSeverity);
@@ -3088,11 +2811,20 @@ export default function App() {
       }}>
         {page === "home" && <HomePage setPage={setPage}/>}
         {page === "camera" && (
-          <CameraPage onResult={handleDetectionResult} latestResult={detectionResult}/>
+          <CameraPage 
+  onResult={handleDetectionResult} 
+  latestResult={detectionResult}
+  setPage={setPage}
+/>
         )}
         {page === "result" && (
-          <ResultPage result={detectionResult} onSeverityUpdate={handleSeverityUpdate}/>
-        )}
+  <ResultPage
+    result={detectionResult}
+    onSeverityUpdate={handleSeverityUpdate}
+    assessmentComplete={assessmentComplete}
+    setAssessmentComplete={setAssessmentComplete}
+  />
+)}
         {page === "map" && <MapPage location={location} locationCity={locationCity}/>}
         {page === "chat" && <ChatPage/>}
       </div>
