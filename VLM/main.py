@@ -11,19 +11,19 @@ from dotenv import load_dotenv
 
 from rag import build_index, retrieve
 
-# -------------------------------
-# 🔐 LOAD ENV
-# -------------------------------
+# ==========================================
+# 🔐 ENVIRONMENT & SETUP
+# ==========================================
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-print("🔑 KEY:", OPENROUTER_API_KEY[:10] if OPENROUTER_API_KEY else "NO KEY")
+print("✅ API Loaded")
 
 app = FastAPI()
 
-# -------------------------------
-# CORS
-# -------------------------------
+# ==========================================
+# CORS MIDDLEWARE
+# ==========================================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,15 +36,15 @@ app.add_middleware(
 def health():
     return {"status": "ok"}
 
-# -------------------------------
-# 🧠 LOAD CLIP
-# -------------------------------
+# ==========================================
+# 🧠 VISION DETECTION (CLIP Model)
+# ==========================================
 model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-# -------------------------------
-# 📚 LOAD RAG
-# -------------------------------
+# ==========================================
+# 📚 RAG INITIALIZATION
+# ==========================================
 pdf_files = [
     "data/pdf1.pdf",
     "data/pdf2.pdf",
@@ -64,31 +64,36 @@ print("🔄 Building RAG...")
 index, chunks = build_index(pdf_files, urls)
 print("✅ RAG READY")
 
-# -------------------------------
-# 🏷️ LABELS
-# -------------------------------
+# ==========================================
+# 🏷️ SEMANTIC INJURY LABELS (IMPROVED)
+# Shorter, clearer labels for better CLIP accuracy
+# ==========================================
 injury_labels = [
-    "person with heavy bleeding from arm",
-    "person with deep cut on leg bleeding",
-    "person with bleeding head wound",
-    "person with burn on hand",
-    "person with severe burn with blisters",
-    "person with broken arm unable to move",
-    "person with broken leg unable to stand",
-    "person with twisted ankle swelling",
-    "person hit head and bleeding",
-    "person choking holding throat",
-    "person unable to breathe gasping",
-    "person holding chest in pain",
-    "person injured in road accident",
-    "person unconscious not responding",
-    "person fainted and collapsed",
+    "heavy bleeding",
+    "deep cut",
+    "head wound with blood",
+    "burn",
+    "severe burn with blisters",
+    "fracture",
+    "broken bone",
+    "swelling",
+    "head injury bleeding",
+    "choking",
+    "breathing difficulty",
+    "chest pain",
+    "trauma injury",
+    "unconscious person",
+    "person collapsed",
 ]
 
-# -------------------------------
-# 🔍 CLIP DETECTION
-# -------------------------------
+# ==========================================
+# 🔍 VISION ANALYZER: CLIP Detection
+# ==========================================
 def detect(image):
+    """
+    Detect injuries from image using CLIP vision model.
+    Returns top 3 detections with confidence scores.
+    """
     inputs = processor(text=injury_labels, images=image, return_tensors="pt", padding=True)
 
     with torch.no_grad():
@@ -106,33 +111,42 @@ def detect(image):
 
     return results
 
-# -------------------------------
-# ⚠️ SEVERITY
-# -------------------------------
+
+# ==========================================
+# 🏥 TRIAGE ENGINE: Severity Scoring
+# ==========================================
 def compute_severity(detections):
+    """
+    Compute initial severity from vision detections.
+    Critical conditions trigger immediate alerts.
+    Otherwise, weighted scoring determines level.
+    """
     score = 0
 
     for d in detections:
         label = d["label"].lower()
         conf = d["confidence"]
 
-        if "unconscious" in label or "not responding" in label:
+        # Critical patterns (absolute)
+        if any(x in label for x in ["unconscious", "collapsed", "choking"]):
             return "critical"
 
-        if "choking" in label or "not breathing" in label:
+        if any(x in label for x in ["breathing difficulty"]):
             return "critical"
 
+        # Weighted severity scoring
         if "heavy bleeding" in label:
             score += 8 * conf
-        elif "bleeding" in label:
+        elif any(x in label for x in ["bleeding", "deep cut"]):
             score += 6 * conf
-        elif "burn" in label:
+        elif any(x in label for x in ["burn", "fracture", "broken"]):
             score += 5 * conf
-        elif "broken" in label:
-            score += 5 * conf
-        else:
+        elif any(x in label for x in ["swelling", "pain", "trauma"]):
             score += 2 * conf
+        else:
+            score += 1 * conf
 
+    # Map score to severity category
     if score >= 6:
         return "critical"
     elif score >= 3:
@@ -140,10 +154,173 @@ def compute_severity(detections):
     else:
         return "low"
 
-# -------------------------------
-# 🤖 OPENROUTER
-# -------------------------------
+
+# ==========================================
+# 🤖 QUESTION ENGINE: Structured Questions
+# ==========================================
+def generate_questions(detections):
+    """
+    Generate structured JSON questions based on detected injuries.
+    Each question has an id, text, options, and type for easy frontend integration.
+    """
+    questions = []
+    labels = [d["label"].lower() for d in detections]
+
+    # Bleeding injury questions
+    if any("bleeding" in l for l in labels):
+        questions.append({
+            "id": "bleeding_severity",
+            "question": "How severe is the bleeding?",
+            "options": ["minor", "moderate", "severe"],
+            "type": "selection"
+        })
+        questions.append({
+            "id": "bleeding_flow",
+            "question": "Is the bleeding continuous or stopping?",
+            "options": ["continuous", "intermittent", "stopped"],
+            "type": "selection"
+        })
+
+    # Head injury questions
+    if any(x in l for x in ["head injury", "head wound"] for l in labels):
+        questions.append({
+            "id": "consciousness",
+            "question": "Is the person conscious and alert?",
+            "options": ["yes", "drowsy", "unconscious"],
+            "type": "selection"
+        })
+        questions.append({
+            "id": "head_symptoms",
+            "question": "Any dizziness, vomiting, or confusion?",
+            "options": ["none", "mild", "severe"],
+            "type": "selection"
+        })
+
+    # Burn injury questions
+    if any("burn" in l for l in labels):
+        questions.append({
+            "id": "burn_cause",
+            "question": "What caused the burn?",
+            "options": ["heat", "chemical", "electrical", "friction"],
+            "type": "selection"
+        })
+        questions.append({
+            "id": "blisters",
+            "question": "Are there blisters or deep tissue damage?",
+            "options": ["no", "minor", "extensive"],
+            "type": "selection"
+        })
+
+    # Fracture/bone injury questions
+    if any(x in l for x in ["fracture", "broken"] for l in labels):
+        questions.append({
+            "id": "limb_movement",
+            "question": "Can the affected limb move?",
+            "options": ["full range", "limited", "immobile"],
+            "type": "selection"
+        })
+        questions.append({
+            "id": "deformity",
+            "question": "Is the limb deformed or bent at odd angle?",
+            "options": ["no", "slightly", "severely"],
+            "type": "selection"
+        })
+
+    # Choking/airway emergency
+    if any("choking" in l for l in labels):
+        questions.append({
+            "id": "airway_response",
+            "question": "Can the person cough or make sounds?",
+            "options": ["yes", "weak", "no"],
+            "type": "selection"
+        })
+
+    # Fallback questions (no specific injury detected)
+    if not questions:
+        questions.append({
+            "id": "general_pain",
+            "question": "Is the person experiencing pain?",
+            "options": ["none", "mild", "severe"],
+            "type": "selection"
+        })
+        questions.append({
+            "id": "consciousness_general",
+            "question": "Is the person conscious and responsive?",
+            "options": ["yes", "partially", "no"],
+            "type": "selection"
+        })
+
+    return questions
+
+
+# ==========================================
+# 💊 SEVERITY REFINEMENT: Answer-Based Scoring
+# ==========================================
+def compute_answer_severity(answers):
+    """
+    Compute severity ONLY from user answers to structured questions.
+    Does NOT recursively boost based on initial vision severity.
+    
+    Returns: (severity_level, numeric_score)
+    """
+    score = 0
+
+    # Bleeding assessment
+    if answers.get("bleeding_severity") == "severe":
+        score += 4
+    elif answers.get("bleeding_severity") == "moderate":
+        score += 2
+    
+    # Consciousness (critical indicator)
+    if answers.get("consciousness") == "unconscious":
+        score += 5
+    elif answers.get("consciousness") == "drowsy":
+        score += 2
+    
+    # Head symptoms
+    if answers.get("head_symptoms") == "severe":
+        score += 3
+    
+    # Breathing difficulty
+    if answers.get("breathing_difficulty") == "severe":
+        score += 5
+    
+    # Choking/airway emergency
+    if answers.get("airway_response") == "no":
+        score += 5
+    elif answers.get("airway_response") == "weak":
+        score += 3
+    
+    # Limb immobility
+    if answers.get("limb_movement") == "immobile":
+        score += 3
+    
+    # Severe deformity
+    if answers.get("deformity") == "severely":
+        score += 3
+    
+    # General pain (minor factor)
+    if answers.get("general_pain") == "severe":
+        score += 1
+
+    # Map answer-based score to severity
+    if score >= 7:
+        severity = "critical"
+    elif score >= 3:
+        severity = "moderate"
+    else:
+        severity = "low"
+
+    return severity, score
+
+
+# ==========================================
+# 🤖 LLM INTEGRATION: OpenRouter API
+# ==========================================
 def call_llm(prompt):
+    """
+    Call OpenRouter API (GPT-4o-mini) for structured medical advice.
+    """
     url = "https://openrouter.ai/api/v1/chat/completions"
 
     headers = {
@@ -165,8 +342,6 @@ def call_llm(prompt):
         response = requests.post(url, headers=headers, json=data)
         res_json = response.json()
 
-        print("🔥 OPENROUTER:", res_json)
-
         if "choices" in res_json:
             return res_json["choices"][0]["message"]["content"]
 
@@ -176,10 +351,9 @@ def call_llm(prompt):
         print("❌ LLM ERROR:", e)
         return "Condition: Error\nRisk: Unknown\nSteps:\n1. Retry\nRed Flags:\n- Severe symptoms"
 
-# -------------------------------
-# 🧹 CLEAN RESPONSE (FIX ** BUG)
-# -------------------------------
+
 def clean_steps(text):
+    """Strip markdown formatting from LLM responses."""
     lines = text.split("\n")
     cleaned = []
 
@@ -193,21 +367,32 @@ def clean_steps(text):
 
     return "\n".join(cleaned)
 
-# -------------------------------
-# 🚀 DETECT ENDPOINT
-# -------------------------------
+
+# ==========================================
+# 🚀 REST ENDPOINTS
+# ==========================================
+
 @app.post("/detect")
 async def detect_endpoint(file: UploadFile = File(...)):
+    """
+    Main detection endpoint:
+    1. Detects injuries from image (CLIP)
+    2. Computes vision-based severity
+    3. Retrieves relevant medical knowledge (RAG)
+    4. Generates LLM response with medical advice
+    5. Creates structured questions based on injuries
+    """
     try:
         image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
+        # 1. Vision detection
         detections = detect(image)
         labels = [d["label"] for d in detections]
 
         max_conf = max([d["confidence"] for d in detections])
 
-        # 🚫 CONFIDENCE GATE
+        # 2. Low confidence gate
         if max_conf < 0.25:
             return {
                 "injuries_detected": detections,
@@ -227,8 +412,10 @@ Red Flags:
                 "low_confidence": True
             }
 
+        # 3. Vision-based severity
         severity = compute_severity(detections)
 
+        # 4. RAG retrieval
         query = f"""
 Patient symptoms:
 {", ".join(labels)}
@@ -239,6 +426,7 @@ What are the immediate first aid steps and risks?
         rag_results = retrieve(query, index, chunks)
         context = "\n".join(rag_results[:3])[:1200] if rag_results else "General first aid"
 
+        # 5. LLM call for medical advice
         prompt = f"""
 Detected injuries:
 {query}
@@ -265,23 +453,8 @@ Red Flags:
         rag_answer = call_llm(prompt)
         rag_answer = clean_steps(rag_answer)
 
-        # 🔥 DYNAMIC QUESTIONS
-        questions = []
-
-        if "bleeding" in query:
-            questions += ["How severe is the bleeding?", "Is blood continuous or stopping?"]
-
-        if "head" in query:
-            questions += ["Is the person conscious?", "Any dizziness or vomiting?"]
-
-        if "burn" in query:
-            questions += ["What caused the burn?", "Are there blisters?"]
-
-        if "broken" in query:
-            questions += ["Can the person move the limb?", "Is there swelling?"]
-
-        if not questions:
-            questions = ["Is the person in pain?", "Is movement normal?"]
+        # 6. Generate structured questions
+        questions = generate_questions(detections)
 
         return {
             "injuries_detected": detections,
@@ -295,33 +468,36 @@ Red Flags:
         print("❌ ERROR:", e)
         return {"error": str(e)}
 
-# -------------------------------
-# 🔥 SEVERITY REFINEMENT
-# -------------------------------
+
 @app.post("/refine")
 async def refine_severity(data: dict = Body(...)):
+    """
+    Refine severity based on structured question answers.
+    
+    Input:
+    {
+      "answers": {
+        "bleeding_severity": "severe",
+        "consciousness": "yes",
+        ...
+      }
+    }
+    
+    Output:
+    {
+      "severity": "critical|moderate|low",
+      "score": numeric_confidence_score
+    }
+    
+    NOTE: Does NOT use initial vision severity to avoid false escalation.
+    Pure answer-based assessment.
+    """
     answers = data.get("answers", {})
-    current = data.get("severity", "low")
 
-    score = 0
+    # Compute severity from answers only
+    severity, score = compute_answer_severity(answers)
 
-    if answers.get("bleeding") == "severe":
-        score += 3
-    if answers.get("conscious") == "no":
-        score += 5
-    if answers.get("breathing") == "no":
-        score += 5
-    if answers.get("pain") == "high":
-        score += 2
-
-    if current == "critical":
-        score += 5
-    elif current == "moderate":
-        score += 3
-
-    if score >= 7:
-        return {"severity": "critical"}
-    elif score >= 4:
-        return {"severity": "moderate"}
-    else:
-        return {"severity": "low"}
+    return {
+        "severity": severity,
+        "score": score
+    }
