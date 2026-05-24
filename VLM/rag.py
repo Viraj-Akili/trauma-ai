@@ -4,11 +4,12 @@ import faiss
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
+import re
 
 # -------------------------------
-# 🔥 LOAD MODEL
+# 🔥 BETTER EMBEDDING MODEL
 # -------------------------------
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+embed_model = SentenceTransformer("all-mpnet-base-v2")
 
 # -------------------------------
 # 📄 LOAD PDF
@@ -47,24 +48,19 @@ def load_html(url):
         return ""
 
 # -------------------------------
-# ✂️ CHUNK TEXT
+# ✂️ BETTER CHUNKING
 # -------------------------------
-import re
-
-def chunk_text(text, chunk_size=300, overlap=50):
+def chunk_text(text, chunk_size=120, overlap=40):
     sentences = re.split(r'(?<=[.!?]) +', text)
 
     chunks = []
     current = ""
 
     for sentence in sentences:
-        # If adding sentence stays within limit
         if len(current) + len(sentence) < chunk_size:
             current += " " + sentence
         else:
             chunks.append(current.strip())
-            
-            # 🔥 Add overlap from previous chunk
             overlap_text = current[-overlap:]
             current = overlap_text + " " + sentence
 
@@ -74,15 +70,14 @@ def chunk_text(text, chunk_size=300, overlap=50):
     return chunks
 
 # -------------------------------
-# 🧠 MEDICAL FILTER (NEW 🔥)
+# 🧠 STRONGER FILTER
 # -------------------------------
 def is_medical_chunk(text):
-
     medical_keywords = [
         "bleeding", "burn", "fracture", "injury", "wound",
         "first aid", "emergency", "unconscious", "breathing",
         "pain", "swelling", "treatment", "symptoms",
-        "CPR", "shock", "bandage", "trauma"
+        "cpr", "shock", "bandage", "trauma"
     ]
 
     emergency_keywords = [
@@ -90,7 +85,6 @@ def is_medical_chunk(text):
     ]
 
     text = text.lower()
-
     score = 0
 
     for k in medical_keywords:
@@ -101,13 +95,12 @@ def is_medical_chunk(text):
         if k in text:
             score += 2
 
-    return score >= 2
+    return score >= 3   # 🔥 stricter filter
 
 # -------------------------------
 # 🧠 BUILD INDEX
 # -------------------------------
 def build_index(pdf_paths=None, urls=None):
-
     pdf_paths = pdf_paths or []
     urls = urls or []
 
@@ -116,24 +109,22 @@ def build_index(pdf_paths=None, urls=None):
     for path in pdf_paths:
         text = load_pdf(path)
         chunks = chunk_text(text)
-
         filtered = [c for c in chunks if is_medical_chunk(c)]
         all_chunks.extend(filtered)
 
     for url in urls:
         text = load_html(url)
         chunks = chunk_text(text)
-
         filtered = [c for c in chunks if is_medical_chunk(c)]
         all_chunks.extend(filtered)
 
     if not all_chunks:
         raise ValueError("No usable medical data found")
 
-    # Remove duplicates
+    # remove duplicates
     all_chunks = list(set(all_chunks))
 
-    print(f"[RAG] Clean medical chunks: {len(all_chunks)}")
+    print(f"[RAG] Clean chunks: {len(all_chunks)}")
 
     embeddings = embed_model.encode(all_chunks, normalize_embeddings=True)
 
@@ -144,17 +135,28 @@ def build_index(pdf_paths=None, urls=None):
     return index, all_chunks
 
 # -------------------------------
-# 🔍 RETRIEVE
+# 🔍 RETRIEVE + RERANK
 # -------------------------------
 def retrieve(query, index, chunks, k=8):
 
-    query_vec = embed_model.encode([query], normalize_embeddings=True)
+    # 🔥 QUERY EXPANSION
+    expanded_query = query + " injury trauma first aid emergency bleeding treatment"
+
+    query_vec = embed_model.encode([expanded_query], normalize_embeddings=True)
     D, I = index.search(query_vec, k)
 
     results = []
     for i in I[0]:
         if i < len(chunks):
-            chunk = chunks[i]
-            results.append(chunk)
+            results.append(chunks[i])
 
-    return results
+    # 🔥 RERANKING (KEY IMPROVEMENT)
+    keywords = ["bleeding", "injury", "burn", "fracture", "emergency"]
+
+    ranked = sorted(
+        results,
+        key=lambda x: sum(kw in x.lower() for kw in keywords),
+        reverse=True
+    )
+
+    return ranked[:5]

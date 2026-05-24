@@ -16,7 +16,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import OpenAI from "openai";
 
 const openai = new OpenAI({
-  apiKey: "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",
+  apiKey: import.meta.env.VITE_OPENROUTER_API_KEY,
   baseURL: "https://openrouter.ai/api/v1",
   dangerouslyAllowBrowser: true
 });
