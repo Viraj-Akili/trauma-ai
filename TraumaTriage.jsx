@@ -13,13 +13,6 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import OpenAI from "openai";
-
-const openai = new OpenAI({
-  apiKey: import.meta.env.VITE_OPENROUTER_API_KEY,
-  baseURL: "https://openrouter.ai/api/v1",
-  dangerouslyAllowBrowser: true
-});
 
 // ─── Design Tokens - Apple Navy & White Theme ────────────────────────────────
 const COLORS = {
@@ -633,39 +626,9 @@ async function callDetectAPI(imageBlob) {
   return adaptBackendResult(data);
 }
 
-// Simple chatbot logic
-
+// Simple chatbot logic - Backend-powered placeholder
   async function getChatbotResponse(userMessage) {
-  try {
-    const response = await openai.chat.completions.create({
-  model: "openai/gpt-4o-mini",
-  messages: [
-    {
-      role: "system",
-      content: `You are a medical injury assistant.
-
-Give first aid advice only.
-Do NOT diagnose.
-Do NOT give medicines.
-
-Always include:
-1. What it might be
-2. First aid steps
-3. Warning signs
-4. When to see a doctor`
-    },
-    {
-      role: "user",
-      content: userMessage
-    }
-  ]
-});
-
-    return response.choices[0].message.content;
-  } catch (error) {
-    console.error(error);
-    return "Error getting response";
-  }
+  return "Medical assistant temporarily unavailable.";
 }
 
 
